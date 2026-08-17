@@ -1,5 +1,24 @@
 # TODO
 
+## Decisions needing review
+
+Autopilot guesses (2026-08-17), recorded so they get a human look:
+
+- **The publish job now runs `check-versions-update.mjs --verify-upstream`**,
+  re-asking the repositories that each new version exists (for every module
+  sharing its key) outside the cooldown. Rationale: the artifact and its
+  fingerprint originate on the runner that executed the batch's Gradle code,
+  so compromised within-major code could forge a matching pair naming an
+  hours-old release. Cost: the publish job now needs the repositories
+  reachable, and a repository outage blocks a publish until rerun (fail
+  closed). Undoing it is dropping the flag from the workflow.
+- **Timeouts**: `update` 90 min, `publish` 15 min, CI `test` 10 min — chosen
+  by rough headroom over expected runtimes, not measurement. A consumer whose
+  Gradle checks legitimately exceed 90 minutes needs the number raised.
+- **`ci.yml` actions are now SHA-pinned** (checkout v5.0.1, setup-node
+  v6.5.0) to match `dependency-update.yml`'s convention. Undoing is
+  reverting to the tags.
+
 ## Alternatives considered and parked
 
 The engine is dependency-free JavaScript with a hand-rolled TOML-subset
