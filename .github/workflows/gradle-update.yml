@@ -94,6 +94,9 @@ jobs:
   # cannot push anything.
   update:
     runs-on: ubuntu-latest
+    # The checks run unreviewed dependency code; without a bound, a hung
+    # Gradle build holds the runner for the 6-hour job default.
+    timeout-minutes: 90
     permissions:
       contents: read
     outputs:
@@ -150,6 +153,9 @@ jobs:
       - name: Resolve updates within their majors
         env:
           CATALOG: ${{ inputs.catalog }}
+          # Typed as a number so it cannot carry shell syntax, but env is the
+          # discipline every input here travels by — data, never script text.
+          COOLDOWN_DAYS: ${{ inputs.cooldown-days }}
         run: |
           set -euo pipefail
           # Every comparison this workflow makes against the catalog path —
@@ -197,7 +203,7 @@ jobs:
           fi
           node .jvm-update/update-versions.mjs \
             --catalog "$CATALOG" \
-            --cooldown-days '${{ inputs.cooldown-days }}' \
+            --cooldown-days "$COOLDOWN_DAYS" \
             --markdown report.md
           # The engine has done its work; removing it keeps the tree check
           # below simple and honest.
@@ -683,6 +689,7 @@ jobs:
     needs: update
     if: needs.update.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       pull-requests: write
@@ -748,13 +755,21 @@ jobs:
       # it lives HERE: this runner has executed no dependency code, so
       # `git show HEAD:<catalog>` and the downloaded artifact are both out of
       # the batch's reach. Only in-place, in-major, stable version bumps in
-      # [versions] pass.
+      # [versions] pass — and --verify-upstream re-asks the repositories that
+      # each new version exists for every module sharing its key, published
+      # outside the cooldown. That last part cannot come from the artifact or
+      # the fingerprint: both originated on the machine that later ran the
+      # batch's own Gradle code, so code compromised within-major could forge
+      # a matching pair naming an hours-old release. Metadata over HTTPS from
+      # a clean runner is exactly the work the trust split allows here.
       - name: Re-validate the dependency diff from a clean context
         env:
           CATALOG: ${{ inputs.catalog }}
+          COOLDOWN_DAYS: ${{ inputs.cooldown-days }}
         run: |
           set -euo pipefail
-          node .jvm-update/check-versions-update.mjs "$CATALOG"
+          node .jvm-update/check-versions-update.mjs \
+            --catalog "$CATALOG" --verify-upstream --cooldown-days "$COOLDOWN_DAYS"
           rm -rf .jvm-update
 
       - name: Stop if the default branch moved while the checks ran

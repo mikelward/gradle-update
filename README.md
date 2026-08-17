@@ -55,7 +55,11 @@ batch *do* execute dependency and plugin code, so:
 - the **publish job** runs on a fresh runner, executes no dependency code,
   re-validates the diff from a clean context (`check-versions-update.mjs`:
   only in-place, in-major, stable, upward version bumps in `[versions]`
-  pass), and is the only job that can write.
+  pass), re-asks the repositories that every new version exists for every
+  module sharing its key with a publish date outside the cooldown (the
+  artifact and its fingerprint both originate on the machine that ran the
+  batch's own Gradle code, so they alone cannot vouch for that), and is the
+  only job that can write.
 
 Read the PR body's check results as evidence, not proof — the catalog diff
 is the part that is actually verified.

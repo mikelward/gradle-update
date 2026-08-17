@@ -20,6 +20,7 @@ import {
   rewriteVersions,
   updateCatalog,
   reportMarkdown,
+  httpsFetcher,
 } from "./update-versions.mjs";
 
 // ---------------------------------------------------------------------------
@@ -530,6 +531,14 @@ test("rewriteVersions refuses a line that no longer matches", () => {
   assert.throws(() => rewriteVersions(text, [{ key: "b", from: "1.0", to: "1.1", line: 1 }]));
 });
 
+test("rewriteVersions moves the value, not a key named like the old version", () => {
+  // A first-occurrence replace over the whole line would rename the KEY here
+  // and leave the version behind — refused downstream, but a weekly red run.
+  const text = ['[versions]', '"1.0" = "1.0"'].join("\n");
+  const out = rewriteVersions(text, [{ key: "1.0", from: "1.0", to: "1.1", line: 1 }]);
+  assert.equal(out, ['[versions]', '"1.0" = "1.1"'].join("\n"));
+});
+
 // ---------------------------------------------------------------------------
 // Whole-catalog runs.
 // ---------------------------------------------------------------------------
@@ -686,6 +695,19 @@ test("dotted catalog aliases are parsed and updated like any other", async () =>
   assert.deepEqual(report.changes.map((c) => [c.key, c.to]), [["foo.bar", "1.1.0"]]);
   assert.ok(report.text.includes('foo.bar = "1.1.0"'));
   assert.equal(report.unmanaged.length, 0); // parsed, not silently skipped
+});
+
+test("a version.ref with no [versions] entry is reported, not dropped", async () => {
+  // Gradle refuses such a catalog outright, but "never silently dropped" is
+  // the report's contract even for shapes that should not exist.
+  const text = [
+    "[versions]",
+    'real = "1.0"',
+    "[libraries]",
+    'a = { group = "g", name = "a", version.ref = "ghost" }',
+  ].join("\n");
+  const { report } = await run(text, {});
+  assert.ok(report.unmanaged.some((u) => u.includes('version.ref "ghost"')));
 });
 
 test("reportMarkdown covers every section and the empty run", () => {
@@ -879,4 +901,82 @@ test("a comment with no space before the hash still parses", async () => {
   });
   assert.deepEqual(report.changes.map((c) => [c.key, c.to]), [["v", "1.1.0"]]);
   assert.ok(report.text.includes('v = "1.1.0"# pinned'));
+});
+
+// ---------------------------------------------------------------------------
+// httpsFetcher: every hop of a redirect chain has to be HTTPS, not just the
+// final one — `redirect: "follow"` would resolve the whole chain internally
+// and report only the last URL, hiding an intermediate HTTP hop where an
+// on-path attacker can rewrite the redirect target.
+// ---------------------------------------------------------------------------
+
+const withFetch = async (impl, fn) => {
+  const real = globalThis.fetch;
+  globalThis.fetch = impl;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = real;
+  }
+};
+
+test("httpsFetcher passes through a plain https response", async () => {
+  const res = await withFetch(
+    async (url) => ({ status: 200, url, headers: { get: () => null } }),
+    () => httpsFetcher("https://repo.example.com/x"),
+  );
+  assert.equal(res.status, 200);
+});
+
+test("httpsFetcher follows an all-https redirect chain", async () => {
+  const seen = [];
+  const res = await withFetch(async (url) => {
+    seen.push(url);
+    if (url === "https://repo.example.com/a") {
+      return { status: 302, headers: { get: (h) => (h === "location" ? "https://mirror.example.com/b" : null) } };
+    }
+    return { status: 200, url, headers: { get: () => null } };
+  }, () => httpsFetcher("https://repo.example.com/a"));
+  assert.equal(res.status, 200);
+  assert.deepEqual(seen, ["https://repo.example.com/a", "https://mirror.example.com/b"]);
+});
+
+test("httpsFetcher refuses a downgrade on the FIRST hop", async () => {
+  await assert.rejects(
+    () => withFetch(async () => { throw new Error("must not be called"); }, () => httpsFetcher("http://repo.example.com/x")),
+    /redirected off https/,
+  );
+});
+
+test("httpsFetcher refuses a downgrade on an INTERMEDIATE hop invisible to the final URL", async () => {
+  // The scenario a naive redirect:"follow" + res.url check misses entirely:
+  // https -> http -> https(attacker), where fetch resolves the whole chain
+  // and only the last, innocent-looking URL is ever exposed.
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      withFetch(async (url) => {
+        calls++;
+        if (url === "https://repo.example.com/a") {
+          return { status: 302, headers: { get: (h) => (h === "location" ? "http://mitm.example.com/b" : null) } };
+        }
+        throw new Error("must not follow the http hop");
+      }, () => httpsFetcher("https://repo.example.com/a")),
+    /redirected off https/,
+  );
+  assert.equal(calls, 1); // the http hop is never fetched
+});
+
+test("httpsFetcher caps redirect chains rather than looping forever", async () => {
+  await assert.rejects(
+    () =>
+      withFetch(
+        async (url) => ({
+          status: 302,
+          headers: { get: (h) => (h === "location" ? "https://repo.example.com/next" : null) },
+        }),
+        () => httpsFetcher("https://repo.example.com/a"),
+      ),
+    /too many redirects/,
+  );
 });

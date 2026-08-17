@@ -724,7 +724,14 @@ export const rewriteVersions = (text, changes) => {
   const lines = text.split("\n");
   for (const { key, from, to, line, quote = '"' } of changes) {
     const old = lines[line];
-    const updated = old.replace(`${quote}${from}${quote}`, `${quote}${to}${quote}`);
+    // Replace only in the value half of the line: a key whose quoted NAME
+    // equals the old version string (`"1.0" = "1.0"`) would otherwise get its
+    // key renamed and its value left behind. No `=` on the line leaves the
+    // text unchanged and lands in the internal-error throw below.
+    const eq = old.indexOf("=");
+    const head = eq === -1 ? old : old.slice(0, eq + 1);
+    const tail = eq === -1 ? "" : old.slice(eq + 1);
+    const updated = head + tail.replace(`${quote}${from}${quote}`, `${quote}${to}${quote}`);
     const lead = old.trimStart();
     const holdsKey =
       lead.startsWith(key) || lead.startsWith(`"${key}"`) || lead.startsWith(`'${key}'`);
@@ -762,6 +769,10 @@ export const updateCatalog = async (
       }
       if (!modulesByKey.has(ref)) modulesByKey.set(ref, []);
       modulesByKey.get(ref).push(module);
+    } else if (ref !== null) {
+      // A version.ref with no [versions] entry. Gradle refuses such a catalog
+      // outright, but "never silently dropped" is the contract here too.
+      unmanaged.push(`${kind} ${name}: version.ref "${ref}" has no [versions] entry`);
     } else if (entry.shorthand !== undefined || entry.version !== undefined) {
       // A literal or rich version outside [versions]: left alone, said aloud.
       unmanaged.push(`${kind} ${name}: version is not a [versions] reference`);
@@ -917,12 +928,44 @@ const parseArgs = (argv) => {
   return args;
 };
 
+// Redirect chains this fetcher will still follow before giving up — real
+// repository redirects (a CDN, a mirror) are one hop, not a chain deep
+// enough to matter; the cap is a loop backstop, not a policy.
+const MAX_REDIRECTS = 10;
+
+// The one fetcher anything in this repository uses against a repository.
+// Repositories are free to redirect (mirrors, CDNs) but never off HTTPS —
+// and every HOP has to be checked, not just the final URL: `redirect:
+// "follow"` resolves the whole chain internally, so an https -> http ->
+// https(attacker) chain reaches the caller as an ordinary https response,
+// `res.url` naming only the last, innocent-looking hop. The intermediate
+// http leg is exactly where an on-path attacker sits to rewrite the
+// redirect target and forge the metadata or Last-Modified date the
+// cooldown stands on. `redirect: "manual"` surfaces each hop so its own
+// scheme can be checked before it is ever followed.
+export const httpsFetcher = async (url, init) => {
+  let current = url;
+  for (let hop = 0; ; hop++) {
+    if (new URL(current).protocol !== "https:") {
+      throw new Error(`redirected off https: ${url} -> ${current}`);
+    }
+    const res = await fetch(current, {
+      ...init,
+      redirect: "manual",
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (res.status < 300 || res.status >= 400 || !res.headers.get("location")) return res;
+    if (hop >= MAX_REDIRECTS) {
+      throw new Error(`too many redirects: ${url} -> ${current} (stopped at ${hop})`);
+    }
+    current = new URL(res.headers.get("location"), current).href;
+  }
+};
+
 const main = async () => {
   const args = parseArgs(process.argv.slice(2));
   const text = readFileSync(args.catalog, "utf8");
-  const fetcher = (url, init) =>
-    fetch(url, { ...init, redirect: "follow", signal: AbortSignal.timeout(30_000) });
-  const report = await updateCatalog(text, { fetcher, cooldownDays: args.cooldownDays });
+  const report = await updateCatalog(text, { fetcher: httpsFetcher, cooldownDays: args.cooldownDays });
 
   if (report.text !== text) writeFileSync(args.catalog, report.text);
   const markdown = reportMarkdown(report);
