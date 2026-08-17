@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateCatalogUpdate } from "./check-versions-update.mjs";
+import { validateCatalogUpdate, verifyUpstream } from "./check-versions-update.mjs";
 
 const CATALOG = [
   "# comment",
@@ -224,4 +224,149 @@ test("a bump under a quoted [versions] header passes", () => {
   const quoted = CATALOG.replace("[versions]", '["versions"]');
   const result = validateCatalogUpdate(quoted, bump(quoted, "1.18.0", "1.19.0"));
   assert.equal(result.ok, true, result.errors.join("; "));
+});
+
+// ---------------------------------------------------------------------------
+// Upstream re-verification: the publish job's answer to a forged artifact.
+// The fingerprint travels from the machine that ran the batch's own Gradle
+// code, so these tests pin the property the texts alone cannot give — every
+// new version must really exist upstream, for every module sharing its key,
+// published outside the cooldown.
+// ---------------------------------------------------------------------------
+
+const REPO = "https://repo.example.com/m2";
+const NOW = new Date("2026-08-15T00:00:00Z");
+const OLD = "2020-01-01T00:00:00Z"; // far outside any cooldown
+const FRESH = "2026-08-14T00:00:00Z"; // the day before NOW
+
+// Same stub shape as update-versions.test.js: url -> { versions, dates }
+// keyed by "<group>:<artifact>".
+const makeFetcher = (modules) => async (url, init = {}) => {
+  const metadata = /^(.*)\/(.+?)\/maven-metadata\.xml$/.exec(url);
+  if (metadata) {
+    const key = `${metadata[1].slice(REPO.length + 1).replaceAll("/", ".")}:${metadata[2]}`;
+    const mod = modules[key];
+    if (!mod) return { ok: false, status: 404 };
+    const body =
+      "<metadata><versioning><versions>" +
+      mod.versions.map((v) => `<version>${v}</version>`).join("") +
+      "</versions></versioning></metadata>";
+    return { ok: true, status: 200, text: async () => body };
+  }
+  const pom = /^(.*)\/([^/]+)\/([^/]+)\/\2-\3\.pom$/.exec(url);
+  if (pom && init.method === "HEAD") {
+    const key = `${pom[1].slice(REPO.length + 1).replaceAll("/", ".")}:${pom[2]}`;
+    const date = modules[key]?.dates?.[pom[3]];
+    if (!date) return { ok: false, status: 404, headers: { get: () => null } };
+    return { ok: true, status: 200, headers: { get: () => date } };
+  }
+  return { ok: false, status: 404, headers: { get: () => null } };
+};
+
+const verify = (newText, changes, modules) =>
+  verifyUpstream(newText, changes, {
+    fetcher: makeFetcher(modules),
+    cooldownDays: 5,
+    now: NOW,
+    repositories: [REPO],
+  });
+
+const BUMPED = bump(CATALOG, "1.18.0", "1.19.0");
+const CORE = [{ key: "coreKtx", from: "1.18.0", to: "1.19.0" }];
+
+test("verifyUpstream passes a version the repository lists outside the cooldown", async () => {
+  const errors = await verify(BUMPED, CORE, {
+    "androidx.core:core-ktx": { versions: ["1.18.0", "1.19.0"], dates: { "1.19.0": OLD } },
+  });
+  assert.deepEqual(errors, []);
+});
+
+test("verifyUpstream refuses a version no repository lists", async () => {
+  const errors = await verify(BUMPED, CORE, {
+    "androidx.core:core-ktx": { versions: ["1.18.0"], dates: {} },
+  });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /no repository lists/);
+});
+
+test("verifyUpstream refuses a version inside the cooldown", async () => {
+  const errors = await verify(BUMPED, CORE, {
+    "androidx.core:core-ktx": { versions: ["1.18.0", "1.19.0"], dates: { "1.19.0": FRESH } },
+  });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /inside the 5-day cooldown/);
+});
+
+test("verifyUpstream refuses a version with no publish date — the fail-closed direction", async () => {
+  const errors = await verify(BUMPED, CORE, {
+    "androidx.core:core-ktx": { versions: ["1.18.0", "1.19.0"], dates: {} },
+  });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /cooldown cannot be verified/);
+});
+
+test("verifyUpstream skips the date lookup when the cooldown is disabled", async () => {
+  // Mirrors decideUpdate's own cooldownDays <= 0 shortcut: a caller that
+  // disabled the cooldown does not need a date, so a repository that omits
+  // Last-Modified must not block an otherwise-valid publish over a check
+  // nobody asked for. Existence is still required.
+  const errors = await verifyUpstream(BUMPED, CORE, {
+    fetcher: makeFetcher({
+      "androidx.core:core-ktx": { versions: ["1.18.0", "1.19.0"], dates: {} },
+    }),
+    cooldownDays: 0,
+    now: NOW,
+    repositories: [REPO],
+  });
+  assert.deepEqual(errors, []);
+});
+
+test("verifyUpstream still refuses a nonexistent version when the cooldown is disabled", async () => {
+  const errors = await verifyUpstream(BUMPED, CORE, {
+    fetcher: makeFetcher({
+      "androidx.core:core-ktx": { versions: ["1.18.0"], dates: {} },
+    }),
+    cooldownDays: 0,
+    now: NOW,
+    repositories: [REPO],
+  });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /no repository lists/);
+});
+
+test("verifyUpstream refuses when the repository errors rather than trusting a partial answer", async () => {
+  const failing = async () => ({ ok: false, status: 503, text: async () => "" });
+  const errors = await verifyUpstream(BUMPED, CORE, {
+    fetcher: failing,
+    cooldownDays: 5,
+    now: NOW,
+    repositories: [REPO],
+  });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /could not verify/);
+});
+
+test("verifyUpstream refuses a changed key nothing references", async () => {
+  const errors = await verify(BUMPED, [{ key: "ghost", from: "1.0", to: "1.1" }], {});
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /nothing vouches/);
+});
+
+test("verifyUpstream holds a shared key until every module lists the version", async () => {
+  const shared = [
+    "[versions]",
+    'lifecycle = "2.10.1"',
+    "[libraries]",
+    'runtime = { group = "androidx.lifecycle", name = "lifecycle-runtime-compose", version.ref = "lifecycle" }',
+    'viewmodel = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycle" }',
+  ].join("\n");
+  const errors = await verify(shared, [{ key: "lifecycle", from: "2.10.0", to: "2.10.1" }], {
+    "androidx.lifecycle:lifecycle-runtime-compose": {
+      versions: ["2.10.0", "2.10.1"],
+      dates: { "2.10.1": OLD },
+    },
+    "androidx.lifecycle:lifecycle-viewmodel-compose": { versions: ["2.10.0"], dates: {} },
+  });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /lifecycle-viewmodel-compose/);
 });
