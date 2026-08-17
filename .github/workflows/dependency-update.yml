@@ -3,7 +3,7 @@ name: Dependency update
 # One batched Gradle dependency PR per week, as a REUSABLE workflow — the JVM
 # sibling of npm-update, consumed with:
 #
-#   uses: mikelward/jvm-update/.github/workflows/dependency-update.yml@main
+#   uses: mikelward/gradle-update/.github/workflows/dependency-update.yml@main
 #
 # from a small caller workflow that owns the cron. See README.md for the
 # caller shape and the permissions it must grant.
@@ -116,7 +116,7 @@ jobs:
       - name: Fetch the update engine
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
-          repository: mikelward/jvm-update
+          repository: mikelward/gradle-update
           ref: main
           path: .jvm-update
           persist-credentials: false
@@ -417,7 +417,7 @@ jobs:
       - name: Fetch the validator
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
-          repository: mikelward/jvm-update
+          repository: mikelward/gradle-update
           # The exact revision the update job resolved with — never a moving
           # ref, so the batch is validated under the same rules that made it.
           ref: ${{ needs.update.outputs.engine_sha }}
@@ -626,7 +626,7 @@ jobs:
             echo '```'
             echo
             echo '---'
-            echo '_Opened by the weekly dependency-update workflow (mikelward/jvm-update)._'
+            echo '_Opened by the weekly dependency-update workflow (mikelward/gradle-update)._'
           } > body.md
 
           # A transient API failure here must not strand the PR on its

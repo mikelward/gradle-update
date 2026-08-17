@@ -1,4 +1,4 @@
-# jvm-update
+# gradle-update
 
 Weekly Gradle dependency batches for mikelward's JVM/Android repos, as a
 reusable GitHub Actions workflow — the sibling of
@@ -77,7 +77,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   update:
-    uses: mikelward/jvm-update/.github/workflows/dependency-update.yml@main
+    uses: mikelward/gradle-update/.github/workflows/dependency-update.yml@main
     permissions:
       contents: write
       pull-requests: write
