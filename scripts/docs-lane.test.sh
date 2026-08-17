@@ -61,22 +61,6 @@ case "$*" in
       esac
     done
     ;;
-  *"/git/ref/heads/"*)
-    # The live tip of a (stacked) base branch.
-    [ "${TIP_FAIL:-0}" = 1 ] && exit 1
-    echo "${BASE_TIP:-basesha}"
-    ;;
-  *"/commits"*)
-    [ "${COMMITS_FAIL:-0}" = 1 ] && exit 1
-    # Fixture lines are "subject" (one parent) or "N:subject"; emit the same
-    # parent-count TSV the real --jq produces.
-    printf '%s\n' "$SUBJECTS" | while IFS= read -r s; do
-      case "$s" in
-        [0-9]:*) printf '%s\t%s\n' "${s%%:*}" "${s#*:}" ;;
-        *) printf '1\t%s\n' "$s" ;;
-      esac
-    done
-    ;;
   *".head.sha"*)
     [ "${HEAD_FAIL:-0}" = 1 ] && exit 1
     # Reads are counted so a fixture can move the head mid-run: from the
