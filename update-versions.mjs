@@ -253,10 +253,12 @@ export const versionRefOf = (entry) => {
 // do: "1.2.3RC1" is [1, 2, 3, RC, 1], so a qualifier attached without a
 // separator is still seen as a qualifier and never mistaken for a platform
 // variant.
+const BOUNDARY = /(?<=\d)(?=[A-Za-z])|(?<=[A-Za-z])(?=\d)/;
+
 const tokenize = (v) =>
   String(v)
     .split(/[.\-_+]/)
-    .flatMap((t) => t.split(/(?<=\d)(?=[A-Za-z])|(?<=[A-Za-z])(?=\d)/));
+    .flatMap((t) => t.split(BOUNDARY));
 
 // Qualifiers that mark a pre-release. Matched per token so "beta" in
 // "4.17-beta-2" fires and a package named like "liberation" cannot. Suffixes
@@ -307,6 +309,40 @@ const compareNumeric = (x, y) => {
   return a < b ? -1 : a > b ? 1 : 0;
 };
 
+// Comparison tokens with Maven's trailing-zero trim applied. Maven ranks
+// "1.0" equal to "1.0.0" AND "1.0-jre" equal to "1.0.0-jre": its
+// trailing-zero trim happens before qualifiers align, so handling zeros
+// only when one side runs out misses the suffixed spellings — the
+// qualifier meets an inserted zero positionally and "numeric outranks
+// qualifier" reports the longer spelling as newer, an artifact swap
+// dressed as an upgrade. Trimming up front makes both shapes one case.
+//
+// The trim works on separator-delimited COMPONENTS, before the
+// digit/letter boundary split: only a component that is entirely zeros is
+// one of Maven's trailing zeros. A zero split off qualifier text
+// ("1.1-0foo") is part of the qualifier's own ordering — Maven ranks
+// "1.1-0foo" above "1.1-foo" — so it must survive. One pass, zeros held
+// back until something decides the run: a nonzero numeric component keeps
+// it, anything else (or the end) drops it. Everything is appended
+// per-token — no spreading a buffer into push(), which would throw past
+// V8's argument limit (~125k) on an unbounded metadata value.
+const compareTokens = (v) => {
+  const out = [];
+  let zeros = 0;
+  for (const c of String(v).split(/[.\-_+]/)) {
+    if (/^0+$/.test(c)) {
+      zeros++;
+    } else if (/^\d+$/.test(c)) {
+      for (; zeros > 0; zeros--) out.push("0");
+      out.push(c);
+    } else {
+      zeros = 0; // the zeros trailed their numeric section — dropped
+      for (const t of c.split(BOUNDARY)) out.push(t);
+    }
+  }
+  return out.filter((t) => !RELEASE_MARKER.test(t)); // pending zeros met the end — dropped
+};
+
 // Total order good enough for release versions: numeric tokens compare
 // numerically, alphanumerics lexically, and a version that is a prefix of a
 // longer one sorts below it ("1.1" < "1.1.1") — except that a trailing
@@ -318,13 +354,14 @@ const compareNumeric = (x, y) => {
 // rank them EQUAL to the bare release: "1.0.0.Final" == "1.0.0.RELEASE" ==
 // "1.0.0", so a synonymous spelling must never read as an upgrade — that
 // would swap artifacts while reporting an upward bump. ("SP1" keeps its
-// digit, so a service pack still ranks above its release.) Trailing zero
-// components are equivalent to Maven for the same reason: "1.0" == "1.0.0",
-// so when one side runs out its missing tokens count as zeros against the
-// other side's numerics — only a qualifier there decides by kind.
+// digit, so a service pack still ranks above its release.) Trailing zeros
+// are equivalent the same way — "1.0" == "1.0.0", "1.0-jre" == "1.0.0-jre"
+// — so each version's zero components are trimmed before comparing (see
+// compareTokens); the run-out zero checks below remain as a backstop for
+// shapes the trim does not produce.
 export const compareVersions = (a, b) => {
-  const ta = tokenize(a).filter((t) => !RELEASE_MARKER.test(t));
-  const tb = tokenize(b).filter((t) => !RELEASE_MARKER.test(t));
+  const ta = compareTokens(a);
+  const tb = compareTokens(b);
   const len = Math.max(ta.length, tb.length);
   for (let i = 0; i < len; i++) {
     const x = ta[i];

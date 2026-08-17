@@ -181,6 +181,28 @@ test("trailing zero components rank equal — 1.0 is 1.0.0", async () => {
   assert.equal(d.to, null);
 });
 
+test("trailing zeros rank equal before a preserved qualifier too", async () => {
+  // Maven ranks these equal; the run-out padding never fires when the
+  // qualifier follows the zeros, so the trim has to happen up front.
+  assert.equal(compareVersions("1.0-jre", "1.0.0-jre"), 0);
+  assert.equal(compareVersions("1.0.0-jre", "1.0-jre"), 0);
+  assert.ok(compareVersions("1.0.1-jre", "1.0-jre") > 0); // a real bump still reads as one
+  // The longer spelling of the same suffixed number is not an upgrade.
+  const d = await decide("1.0-jre", ["1.0-jre", "1.0.0-jre"]);
+  assert.equal(d.to, null);
+  // A long zero run stays linear to process and correct at both fates:
+  // dropped at the end, kept when a nonzero numeric closes the run — even
+  // past V8's ~125k argument limit, which a spread-into-push would throw on.
+  const zeros = ".0".repeat(200000);
+  assert.equal(compareVersions(`1${zeros}`, "1"), 0);
+  assert.ok(compareVersions(`1${zeros}.1`, "1") > 0);
+  // A zero attached to qualifier TEXT is not a trailing component: Maven
+  // ranks 1.1-0foo above 1.1-foo, so the digit-led qualifier must survive
+  // the trim rather than collapse the two spellings into a tie.
+  assert.ok(compareVersions("1.1-0foo", "1.1-foo") > 0);
+  assert.ok(compareVersions("1.1-foo", "1.1-0foo") < 0);
+});
+
 test("an incubating pin graduates — Apache maturity, not platform", async () => {
   const d = await decide("0.5-incubating", ["0.5-incubating", "0.6"]);
   assert.equal(d.to, "0.6");
