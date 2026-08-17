@@ -1,0 +1,493 @@
+name: Dependency update
+
+# One batched Gradle dependency PR per week, as a REUSABLE workflow — the JVM
+# sibling of npm-update, consumed with:
+#
+#   uses: mikelward/jvm-update/.github/workflows/dependency-update.yml@main
+#
+# from a small caller workflow that owns the cron. See README.md for the
+# caller shape and the permissions it must grant.
+#
+# update-versions.mjs moves every entry in gradle/libs.versions.toml to the
+# newest stable release WITHIN ITS CURRENT MAJOR, so a direct dependency
+# cannot cross a major: the publish job re-derives that from the diff
+# (check-versions-update.mjs) and stops the run if one did. Majors stay a
+# deliberate, human-initiated migration.
+#
+# Beneath the catalog the promise is weaker than npm-update's: these repos
+# have no Gradle lockfile, so a same-major direct bump can pull a new
+# TRANSITIVE major with nothing in the catalog diff to show for it. The
+# consumer's own test suite (run here) and its dispatched CI are the coverage
+# for that. Read "no majors" as guaranteed for what the catalog declares,
+# best-effort beneath it.
+#
+# The trust split is inherited from npm-update wholesale: resolving versions
+# reads Maven METADATA only and executes no dependency code, but the Gradle
+# checks that validate the batch execute dependency and plugin code by
+# definition. So the update job holds no write token, the manifests are
+# fingerprinted before Gradle runs, and the publish job — a fresh runner that
+# installs nothing — is where the diff is actually validated and pushed.
+
+on:
+  workflow_call:
+    inputs:
+      catalog:
+        description: Path to the Gradle version catalog.
+        type: string
+        default: gradle/libs.versions.toml
+      cooldown-days:
+        description: >-
+          Minimum age in days of a release before this job will take it — the
+          Gradle analog of .npmrc's min-release-age, so a compromised release
+          has time to be yanked before an unattended job picks it up.
+        type: number
+        default: 5
+      java-version:
+        description: JDK major for the Gradle checks.
+        type: string
+        default: '21'
+      checks:
+        description: >-
+          Commands that validate the batch, one per line. They run in the
+          update job, after the catalog is rewritten and fingerprinted.
+        type: string
+        default: |
+          ./gradlew test
+          ./gradlew lint
+      commit-prefix:
+        description: >-
+          Subject prefix for the batch commit and PR title. The Android repos
+          keep dependency bumps out of release notes with `internal:`; the
+          web repos use `deps:`.
+        type: string
+        default: 'internal:'
+      ci-workflow:
+        description: >-
+          Workflow file to dispatch against the pushed branch, with a `pr`
+          input naming the pull request — required because a PR opened by
+          GITHUB_TOKEN triggers no `on: pull_request` workflows. It must
+          carry `workflow_dispatch` on the default branch. Empty disables
+          the dispatch.
+        type: string
+        default: android-ci.yml
+
+# No permissions here: the CALLER grants them (contents: write,
+# pull-requests: write, actions: write), and each job below downscopes. The
+# job that runs unreviewed dependency code gets a read-only token; only the
+# publish job, which runs none, can write.
+
+jobs:
+  # Rewrites the catalog and runs the checks. Gradle executes third-party
+  # plugin and dependency code here, so this job holds no write token and
+  # cannot push anything.
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.changed.outputs.changed }}
+      passed: ${{ steps.checks.outputs.passed }}
+      base: ${{ steps.base.outputs.sha }}
+      catalog_sha: ${{ steps.changed.outputs.catalog_sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          # Always the default branch, never the dispatch ref: a manual run
+          # from a feature branch must not base the dependency branch on it.
+          # (If the expression is ever empty, checkout falls back to the
+          # default branch anyway, so the failure mode is benign.)
+          ref: ${{ github.event.repository.default_branch }}
+          # The Gradle checks execute unreviewed code; the token is read-only,
+          # and dropping it from .git/config keeps one less credential in
+          # reach anyway.
+          persist-credentials: false
+
+      # Pinned and handed to the publish job, so a commit landing on the
+      # default branch while the checks run cannot be silently reverted by
+      # publishing a catalog resolved against the older base.
+      - name: Record the base commit
+        id: base
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The engine, from this repository at main — the same convention as
+      # consuming the workflow itself at @main: no build step, no
+      # dependencies, the file that runs is the file you can read there.
+      - name: Fetch the update engine
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          repository: mikelward/jvm-update
+          ref: main
+          path: .jvm-update
+          persist-credentials: false
+
+      # Reads Maven metadata over HTTPS and rewrites [versions] in place.
+      # No dependency code executes here — that starts with the Gradle
+      # checks below, after the fingerprint.
+      - name: Resolve updates within their majors
+        run: |
+          set -euo pipefail
+          node .jvm-update/update-versions.mjs \
+            --catalog '${{ inputs.catalog }}' \
+            --cooldown-days '${{ inputs.cooldown-days }}' \
+            --markdown report.md
+          # The engine has done its work; removing it keeps the tree check
+          # below simple and honest.
+          rm -rf .jvm-update
+
+      - name: Stop early if nothing moved
+        id: changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- '${{ inputs.catalog }}'; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'No dependency updates available this run.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+            git diff --stat -- '${{ inputs.catalog }}' > deps-stat.txt
+            # Fingerprint now, before any Gradle code runs. A step OUTPUT
+            # rather than a file: the runner captures it when this step ends,
+            # and nothing that runs afterwards can reach back and change it.
+            echo "catalog_sha=$(sha256sum '${{ inputs.catalog }}' | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+            git diff -- '${{ inputs.catalog }}' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Set up JDK
+        if: steps.changed.outputs.changed == 'true'
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654  # v5.2.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      - name: Set up Gradle
+        if: steps.changed.outputs.changed == 'true'
+        uses: gradle/actions/setup-gradle@4c125117fe7c5aed11272ec4213f602f012f89f2  # v5
+        with:
+          # This job runs unreviewed dependency code; it must never write the
+          # shared Gradle cache — same rule the consumers' own CI applies to
+          # non-main refs.
+          cache-read-only: true
+
+      # A PR opened by GITHUB_TOKEN triggers no `on: pull_request` workflows
+      # (GitHub's loop-prevention rule), so the consumer's CI will NOT run on
+      # the update PR by itself: the checks happen HERE or not at all. Every
+      # check runs even after one fails, so the PR body reports the whole
+      # picture. Gradle executes dependency and plugin code from the versions
+      # this run just picked — this is the untrusted window.
+      - name: Run the checks
+        if: steps.changed.outputs.changed == 'true'
+        id: checks
+        env:
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          set +e
+          failed=0
+          : > checks.md
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::$cmd"
+            eval "$cmd"
+            rc=$?
+            echo '::endgroup::'
+            if [ $rc -eq 0 ]; then
+              echo "- ✅ \`$cmd\`" >> checks.md
+            else
+              echo "- ❌ \`$cmd\` (exit $rc)" >> checks.md
+              failed=1
+            fi
+          done <<< "$CHECKS"
+          cat checks.md >> "$GITHUB_STEP_SUMMARY"
+          if [ $failed -eq 0 ]; then
+            echo 'passed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
+          fi
+          # Gradle build scripts and plugins ran above and $GITHUB_PATH /
+          # $GITHUB_ENV apply to LATER steps, so a planted binary could
+          # otherwise shadow `git` and `sha256sum` for the verification
+          # below. Emptying them means the runner applies nothing.
+          : > "$GITHUB_PATH"
+          : > "$GITHUB_ENV"
+
+      # The checks above and the artifact below have to describe the SAME
+      # tree. Anything outside the catalog is a stop, not something to strip
+      # silently: a dependency that rewrites your source during a build is a
+      # decision for a human.
+      - name: Verify only the catalog changed
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          CATALOG: ${{ inputs.catalog }}
+        run: |
+          set -euo pipefail
+          # `git status`, not `git diff`: diff only sees tracked changes, so
+          # an untracked file dropped into the tree by a plugin would sail
+          # past it. The allowed extras are files this job writes itself.
+          # `grep -Fx`, not a regex: the catalog path is data, and even the
+          # default path's dots would otherwise match any character — a
+          # planted `gradle/libsXversionsYtoml` must not ride the allowlist,
+          # and a metacharacter in a custom path must not break the guard.
+          unexpected=$(git status --porcelain --untracked-files=all \
+            | sed 's/^...//' \
+            | grep -Fxv -e "$CATALOG" -e checks.md -e deps-stat.txt -e report.md || true)
+          if [ -n "$unexpected" ]; then
+            echo '::error::The batch touched files outside the version catalog. Not opening a PR — inspect these first:'
+            echo "$unexpected"
+            exit 1
+          fi
+          # IGNORED paths as a separate pass — `--ignored` alone collapses a
+          # fully-ignored directory to one entry, which is what makes looking
+          # affordable; combined with --untracked-files=all it would list all
+          # of ~/.gradle-scale noise file by file. The allowlist is Gradle's
+          # own outputs; anything else ignored is something new in the tree
+          # and worth a human look.
+          planted=$(git status --porcelain --ignored \
+            | grep '^!! ' \
+            | sed 's/^!! //' \
+            | grep -Ev '^(\.gradle/|\.kotlin/|local\.properties$|([^ ]*/)?build/)' || true)
+          if [ -n "$planted" ]; then
+            echo '::error::The batch left unexpected IGNORED files in the tree. Not opening a PR — inspect these first:'
+            echo "$planted"
+            exit 1
+          fi
+          # Nothing may have touched the catalog since the engine rewrote it.
+          if [ "$(sha256sum '${{ inputs.catalog }}' | cut -d' ' -f1)" != '${{ steps.changed.outputs.catalog_sha }}' ]; then
+            echo '::error::The catalog changed AFTER the engine resolved it — something in the check run rewrote it. Not opening a PR.'
+            exit 1
+          fi
+
+      - name: Hand off the dependency diff
+        if: steps.changed.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dependency-update
+          path: |
+            ${{ inputs.catalog }}
+            checks.md
+            deps-stat.txt
+            report.md
+          retention-days: 1
+          if-no-files-found: error
+
+  # Publishes. Runs on a fresh runner, installs nothing, and executes no
+  # dependency code — so the write token is never on a machine where an
+  # unreviewed dependency has run.
+  publish:
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      # Dispatching the consumer's CI on the pushed branch is a write to the
+      # Actions API — granted HERE and not to the update job, so dependency
+      # code can never start a workflow.
+      actions: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          # The exact commit the update job tested, not the branch tip.
+          ref: ${{ needs.update.outputs.base }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5.0.0
+        with:
+          name: dependency-update
+
+      # The artifact traveled through a machine that ran dependency code;
+      # check it against the fingerprint taken before any of that ran. The
+      # fingerprint came across as a job output, which lives in the runner's
+      # control plane rather than on that machine's disk.
+      - name: Check the artifact against the pre-check fingerprint
+        run: |
+          set -euo pipefail
+          [ "$(sha256sum '${{ inputs.catalog }}' | cut -d' ' -f1)" = '${{ needs.update.outputs.catalog_sha }}' ] \
+            || { echo '::error::The catalog does not match what the update job resolved.'; exit 1; }
+
+      - name: Fetch the validator
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          repository: mikelward/jvm-update
+          ref: main
+          path: .jvm-update
+          persist-credentials: false
+
+      # The authoritative check on what this commit contains, and the reason
+      # it lives HERE: this runner has executed no dependency code, so
+      # `git show HEAD:<catalog>` and the downloaded artifact are both out of
+      # the batch's reach. Only in-place, in-major, stable version bumps in
+      # [versions] pass.
+      - name: Re-validate the dependency diff from a clean context
+        run: |
+          set -euo pipefail
+          node .jvm-update/check-versions-update.mjs '${{ inputs.catalog }}'
+          rm -rf .jvm-update
+
+      - name: Stop if the default branch moved while the checks ran
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch='${{ github.event.repository.default_branch }}'
+          current=$(gh api "repos/${{ github.repository }}/commits/$branch" --jq .sha)
+          if [ "$current" != '${{ needs.update.outputs.base }}' ]; then
+            echo "::error::$branch moved from ${{ needs.update.outputs.base }} to $current while the checks ran, so the verified catalog and the branch it would land on no longer match. Re-run the workflow."
+            exit 1
+          fi
+
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CATALOG: ${{ inputs.catalog }}
+        run: |
+          set -euo pipefail
+          # Keyed on the RUN DATE: the job runs weekly, so a month-scoped
+          # name would collide with the previous week's branch.
+          today=$(date -u +%Y-%m-%d)
+          branch="deps/update-$today"
+
+          if [ '${{ needs.update.outputs.passed }}' = 'true' ]; then
+            title="${{ inputs.commit-prefix }} Update dependencies ($today)"
+            verdict='All checks passed in the job that produced this branch.'
+          else
+            title="${{ inputs.commit-prefix }} Update dependencies ($today) — CHECKS FAILING"
+            verdict='**One or more checks failed.** Do not merge until they are fixed — the failures are real, not flakes to route around.'
+          fi
+
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+
+          # Never force-push: the PR body tells reviewers to push fixes to
+          # this branch. If today's branch already exists there are two
+          # cases, and a RERUN of this very run is the common one: adopt the
+          # existing branch when its catalog is byte-identical to the
+          # verified artifact (it is this run's own earlier attempt — reuse
+          # it and its PR instead of duplicating them). Anything else is a
+          # different batch, so take a run+attempt-scoped name of its own —
+          # attempt-scoped so a rerun after a fallback push cannot collide
+          # with the earlier attempt's fallback and be rejected.
+          adopt=false
+          if git ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1; then
+            git fetch --quiet "$remote" "refs/heads/$branch"
+            if [ "$(git show "FETCH_HEAD:$CATALOG" 2>/dev/null | sha256sum | cut -d' ' -f1)" = '${{ needs.update.outputs.catalog_sha }}' ]; then
+              adopt=true
+              echo "Adopting existing branch $branch — same verified catalog (a rerun)." >> "$GITHUB_STEP_SUMMARY"
+            else
+              branch="$branch-run${{ github.run_number }}-${{ github.run_attempt }}"
+              echo "Today's branch already exists with a different batch; using $branch instead." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+          if [ "$adopt" != true ]; then
+            # Belt and braces on a fresh runner where nothing has run.
+            git config --global core.hooksPath /dev/null
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git switch -c "$branch"
+            # Stage by name: the artifact only carries these files, but naming
+            # the catalog keeps that true even if it ever carries more.
+            git add -- "$CATALOG"
+            git commit -q -m "$title"
+            git push "$remote" "HEAD:refs/heads/$branch"
+          fi
+
+          # A PR opened by GITHUB_TOKEN triggers no `on: pull_request`
+          # workflows, so nothing would start CI on this branch by itself.
+          # `workflow_dispatch` is the documented exception — a dispatch made
+          # with GITHUB_TOKEN does create a run — so ask for one explicitly
+          # against the branch just pushed, naming the PR so the consumer's
+          # docs lane can bind the run to it. Non-fatal either way: the
+          # branch is pushed and the update job has already run every check,
+          # so a failed dispatch must not turn a pushed branch into no PR —
+          # but it is reported in the PR BODY, because "CI never started" and
+          # "CI passed quietly" look identical from the PR otherwise.
+          pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?head=${GITHUB_REPOSITORY_OWNER}:${branch}&state=open" --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            pr_url=$(gh pr create --title "$title" \
+              --body 'Opening — the checks report lands in a moment.' \
+              --base '${{ github.event.repository.default_branch }}' --head "$branch")
+            pr=${pr_url##*/}
+          fi
+
+          ci_started=false
+          if [ -n '${{ inputs.ci-workflow }}' ]; then
+            if gh workflow run '${{ inputs.ci-workflow }}' --ref "$branch" -f pr="$pr"; then
+              ci_started=true
+            else
+              echo "Could not start CI on $branch; the PR body says so." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+          {
+            echo 'Every version catalog entry moved to the newest stable release **within'
+            echo 'its current major**. No majors: those need a deliberate migration and'
+            echo 'this job cannot produce one. (Transitives are resolved by Gradle from'
+            echo 'these declared versions — the checks below are the coverage there.)'
+            echo
+            cat report.md
+            echo '## Checks'
+            echo
+            cat checks.md
+            echo
+            echo "$verdict"
+            echo
+            if [ "$ci_started" = true ]; then
+              echo '> These ran in the workflow job, not on this PR. A PR opened by'
+              echo '> `GITHUB_TOKEN` does not trigger `on: pull_request` workflows, so CI'
+              echo '> does not start here on its own — this job dispatched `${{ inputs.ci-workflow }}`'
+              echo '> against the branch instead, and that run reports on this PR like any'
+              echo '> other.'
+            else
+              echo '> **CI was not started on this branch, so the checks above are the only'
+              echo '> ones that ran.** A PR opened by `GITHUB_TOKEN` does not trigger'
+              echo '> `on: pull_request` workflows, and no dispatch succeeded. Push any'
+              echo '> commit to the branch and CI runs normally from then on.'
+            fi
+            echo
+            echo '## Changed'
+            echo
+            echo '```'
+            cat deps-stat.txt
+            echo '```'
+            echo
+            echo '---'
+            echo '_Opened by the weekly dependency-update workflow (mikelward/jvm-update)._'
+          } > body.md
+
+          # A transient API failure here must not strand the PR on its
+          # placeholder body under `set -e` — the assignment below still has
+          # to run, because the assignee is how an unattended PR gets seen.
+          edited=false
+          for _ in 1 2 3; do
+            if gh pr edit "$pr" --title "$title" --body-file body.md; then
+              edited=true
+              break
+            fi
+            sleep 5
+          done
+          if [ "$edited" != true ]; then
+            echo "::warning::Could not publish the PR body for #$pr; it still carries the placeholder."
+          fi
+
+          # Put it in front of a human — an unattended weekly PR nobody is
+          # assigned to is exactly the PR that goes unnoticed. Non-fatal: an
+          # opened-but-unassigned PR is recoverable.
+          reviewer='${{ github.repository_owner }}'
+          if ! gh pr edit "$pr" --add-assignee "$reviewer" --add-reviewer "$reviewer"; then
+            echo "Could not assign or request review from @$reviewer — the PR is open and needs a look." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Arm auto-merge so a clean batch lands unattended; the ruleset's
+          # required checks do the reviewing. ONLY when this run's own checks
+          # passed: auto-merge waits for the ruleset's requirements, and a
+          # consumer whose ruleset requires little (or whose CI dispatch
+          # failed, leaving nothing red on the PR) would otherwise merge a
+          # batch this very workflow titled CHECKS FAILING. A failing batch
+          # stays open, assigned, and waits for a human. Non-fatal: repos
+          # without auto-merge allowed just fall back to manual.
+          if [ '${{ needs.update.outputs.passed }}' = 'true' ]; then
+            if ! gh pr merge --auto --rebase "$pr"; then
+              echo 'Could not arm auto-merge — the PR is open and waits for a manual merge.' \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo 'Checks failed, so auto-merge was deliberately not armed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
