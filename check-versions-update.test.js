@@ -49,6 +49,13 @@ test("a major crossing is refused", () => {
   assert.match(result.errors[0], /crosses a major/);
 });
 
+test("a zero-padded respelling of a suffixed version is refused — not an upgrade", () => {
+  const withJre = CATALOG.replace('coreKtx = "1.18.0"', 'lib = "1.0-jre"');
+  const result = validateCatalogUpdate(withJre, bump(withJre, "1.0-jre", "1.0.0-jre"));
+  assert.equal(result.ok, false);
+  assert.match(result.errors[0], /not an upgrade/);
+});
+
 test("a major crossing past 2^53 is still refused — no precision loss", () => {
   const huge = CATALOG.replace('coreKtx = "1.18.0"', 'stamp = "9007199254740992.1"');
   const result = validateCatalogUpdate(huge, bump(huge, "9007199254740992.1", "9007199254740993.2"));
