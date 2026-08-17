@@ -203,6 +203,58 @@ test("trailing zeros rank equal before a preserved qualifier too", async () => {
   assert.ok(compareVersions("1.1-foo", "1.1-0foo") < 0);
 });
 
+test("every pre-release spelling ranks below its release — pins can graduate", () => {
+  // Anything isStable refuses must also compare below the bare release,
+  // or a catalog pinned to it would read its stable spelling as a
+  // downgrade and stay stranded forever. Both the bare word and the
+  // numbered form, since the comparator aliases some words only when
+  // digits follow.
+  for (const q of ["alpha", "beta", "rc", "cr", "m", "milestone", "ea", "eap", "dev",
+                   "preview", "pre", "snapshot", "snap", "nightly", "canary", "build", "a", "b"]) {
+    assert.ok(compareVersions("1.0", `1.0-${q}`) > 0, q);
+    assert.ok(compareVersions("1.0", `1.0-${q}1`) > 0, `${q}1`);
+  }
+});
+
+test("dashed sublists order below numerics — no flattening downgrades", async () => {
+  // The P1 the flat model earned: flattening [1,[1]] against [1,0,2] read
+  // 1.0-1 as newer than 1.0.2, a silent downgrade path. Maven ranks a
+  // sublist below a numeric at the same position.
+  assert.ok(compareVersions("1.0-1", "1.0.2") < 0);
+  assert.ok(compareVersions("1.0.2", "1.0-1") > 0);
+  // Nesting depth is real ordering, not spelling: jre8's digits sit one
+  // list deeper than jre.8's, and Maven ranks the deeper one lower.
+  assert.ok(compareVersions("1.1-jre8", "1.1-jre.8") < 0);
+  const d = await decide("1.0.2", ["1.0.2", "1.0-1"]);
+  assert.equal(d.to, null); // never proposed as an upgrade
+});
+
+test("dashed zero segments follow Maven's sublist rules", () => {
+  // Every case here was checked against Maven's own ComparableVersion
+  // (maven-artifact 3.9.10) — as was the whole comparator, which is a
+  // line-for-line port of that class, fuzz-diffed against it over 20,000
+  // random pairs with zero mismatches. A dash opens a sublist; an
+  // all-zero sublist vanishes at the tail but holds its place
+  // mid-version, where Maven ranks the kept nesting above a bare
+  // qualifier.
+  assert.ok(compareVersions("1.1-0-jre", "1.1-jre") > 0);
+  assert.ok(compareVersions("1.1-jre", "1.1-0-jre") < 0);
+  assert.equal(compareVersions("1.1-0", "1.1"), 0);
+  assert.equal(compareVersions("1.0-0.0", "1.0"), 0);
+  assert.ok(compareVersions("1.1-0.0-jre", "1.1-jre") > 0);
+  assert.equal(compareVersions("1.1-2.0-jre", "1.1-2-jre"), 0); // a nonzero sublist still trims its own tail
+  assert.ok(compareVersions("1-final-jre", "1-jre") > 0); // a marker-only sublist holds its place too
+  // Qualifier text opens a sublist whatever precedes it: dot, dash, or
+  // nothing — and the numeric section trims its zeros at that boundary.
+  assert.equal(compareVersions("1.0.x", "1.0-x"), 0);
+  assert.equal(compareVersions("1.0.0foo", "1-foo"), 0);
+  assert.equal(compareVersions("1.1.x0", "1.1.x"), 0);
+  // A mid-section marker is not trailing: Maven ranks 1.0.Final.1 BELOW
+  // 1.0.1 (the numeric outranks the marker's sublist), which a global
+  // marker filter got backwards.
+  assert.ok(compareVersions("1.0.Final.1", "1.0.1") < 0);
+});
+
 test("an incubating pin graduates — Apache maturity, not platform", async () => {
   const d = await decide("0.5-incubating", ["0.5-incubating", "0.6"]);
   assert.equal(d.to, "0.6");

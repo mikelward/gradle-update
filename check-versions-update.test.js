@@ -49,6 +49,19 @@ test("a major crossing is refused", () => {
   assert.match(result.errors[0], /crosses a major/);
 });
 
+test("a dashed numeric that Maven ranks older is refused — not an upgrade", () => {
+  const pinned = CATALOG.replace('coreKtx = "1.18.0"', 'lib = "1.0.2"');
+  const result = validateCatalogUpdate(pinned, bump(pinned, "1.0.2", "1.0-1"));
+  assert.equal(result.ok, false);
+  assert.match(result.errors[0], /not an upgrade/);
+});
+
+test("a dashed-zero spelling that Maven ranks newer passes as an upgrade", () => {
+  const withJre = CATALOG.replace('coreKtx = "1.18.0"', 'lib = "1.1-jre"');
+  const result = validateCatalogUpdate(withJre, bump(withJre, "1.1-jre", "1.1-0-jre"));
+  assert.equal(result.ok, true, result.errors.join("; "));
+});
+
 test("a zero-padded respelling of a suffixed version is refused — not an upgrade", () => {
   const withJre = CATALOG.replace('coreKtx = "1.18.0"', 'lib = "1.0-jre"');
   const result = validateCatalogUpdate(withJre, bump(withJre, "1.0-jre", "1.0.0-jre"));
