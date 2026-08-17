@@ -1,0 +1,26 @@
+name: probe-headers
+# Temporary probe: does dl.google.com serve genuine per-version Last-Modified
+# headers from a GitHub-hosted runner (no proxy in the path)? Deleted with its
+# branch once read.
+on:
+  push:
+    branches: [claude/cooldown-probe]
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: HEAD several POMs and print headers
+        run: |
+          set -euo pipefail
+          for url in \
+            https://dl.google.com/android/maven2/androidx/core/core-ktx/1.19.0/core-ktx-1.19.0.pom \
+            https://dl.google.com/android/maven2/androidx/core/core-ktx/1.0.0/core-ktx-1.0.0.pom \
+            https://dl.google.com/android/maven2/androidx/compose/compose-bom/2026.08.00/compose-bom-2026.08.00.pom \
+            https://dl.google.com/android/maven2/com/android/application/com.android.application.gradle.plugin/9.3.1/com.android.application.gradle.plugin-9.3.1.pom \
+            https://repo.maven.apache.org/maven2/org/robolectric/robolectric/4.16.1/robolectric-4.16.1.pom \
+            https://plugins.gradle.org/m2/io/github/takahirom/roborazzi/io.github.takahirom.roborazzi.gradle.plugin/1.72.0/io.github.takahirom.roborazzi.gradle.plugin-1.72.0.pom; do
+            echo "== $url"
+            curl -sIL --max-time 20 "$url" | grep -iE '^(HTTP|last-modified|age|via|x-cache|server)' || true
+          done
