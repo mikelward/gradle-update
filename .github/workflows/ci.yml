@@ -37,7 +37,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.run.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
       - name: Self-test the lane rules
@@ -59,14 +59,15 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0
         with:
           node-version: '24'
 
@@ -91,7 +92,7 @@ jobs:
     needs: [classify, test]
     if: always()
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
       - name: Verdict
@@ -103,6 +104,8 @@ jobs:
           EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           CLASSIFY: ${{ needs.classify.result }}
+          # Every job the gate weighs: a job added to this workflow but
+          # missing from RESULTS (and needs) is invisible to the verdict.
           RESULTS: >-
             test=${{ needs.test.result }}
         run: scripts/docs-lane.sh gate
