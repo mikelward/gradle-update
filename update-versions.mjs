@@ -309,90 +309,201 @@ const compareNumeric = (x, y) => {
   return a < b ? -1 : a > b ? 1 : 0;
 };
 
-// Comparison tokens with Maven's trailing-zero trim applied. Maven ranks
-// "1.0" equal to "1.0.0" AND "1.0-jre" equal to "1.0.0-jre": its
-// trailing-zero trim happens before qualifiers align, so handling zeros
-// only when one side runs out misses the suffixed spellings — the
-// qualifier meets an inserted zero positionally and "numeric outranks
-// qualifier" reports the longer spelling as newer, an artifact swap
-// dressed as an upgrade. Trimming up front makes both shapes one case.
+// ---------------------------------------------------------------------------
+// Maven's ComparableVersion, ported line for line from maven-artifact 3.9.10
+// (org.apache.maven.artifact.versioning.ComparableVersion). Every earlier
+// attempt to PARAPHRASE its rules — three of them, each verified against a
+// different oracle case and each wrong on the next — is why this is now a
+// transcription rather than a reading: the parser builds the same nested
+// item tree (numbers, qualifier strings, dash-opened sublists), normalize
+// removes null items scanning back from each list's tail WITHOUT stopping
+// at nested sublists, and comparison uses Maven's item-type ordering
+// (number > sublist > qualifier at the same position). The port was
+// cross-checked against the real class running locally, including a fuzz
+// pass; see the tests.
 //
-// The trim works on separator-delimited COMPONENTS, before the
-// digit/letter boundary split: only a component that is entirely zeros is
-// one of Maven's trailing zeros. A zero split off qualifier text
-// ("1.1-0foo") is part of the qualifier's own ordering — Maven ranks
-// "1.1-0foo" above "1.1-foo" — so it must survive. One pass, zeros held
-// back until something decides the run: a nonzero numeric component keeps
-// it, anything else (or the end) drops it. Everything is appended
-// per-token — no spreading a buffer into push(), which would throw past
-// V8's argument limit (~125k) on an unbounded metadata value.
-const compareTokens = (v) => {
-  const out = [];
-  let zeros = 0;
-  for (const c of String(v).split(/[.\-_+]/)) {
-    if (/^0+$/.test(c)) {
-      zeros++;
-    } else if (/^\d+$/.test(c)) {
-      for (; zeros > 0; zeros--) out.push("0");
-      out.push(c);
-    } else {
-      zeros = 0; // the zeros trailed their numeric section — dropped
-      for (const t of c.split(BOUNDARY)) out.push(t);
-    }
-  }
-  return out.filter((t) => !RELEASE_MARKER.test(t)); // pending zeros met the end — dropped
+// Deliberate deviations, each a product decision and each conservative:
+// - The extended pre-release set (ea, eap, dev, preview, pre, snap,
+//   nightly, canary, build) ranks BELOW the release like snapshot does.
+//   Maven ranks unknown qualifiers above it, which would strand a catalog
+//   pinned to "1.0-eap1" forever: its stable "1.0" would read as a
+//   downgrade and never be proposed.
+// - "incubating" ranks EQUAL to the release (Maven: above it), so an
+//   Apache pin can graduate and a respelling is never an upgrade.
+// - "_" and "+" parse as dashes. Maven reads them as qualifier text;
+//   catalogs do not use them, and a separator reading is the sane one for
+//   an input that somehow does ("+"' is already refused by
+//   isPlainVersion).
+const QUALIFIERS = ["alpha", "beta", "milestone", "rc", "snapshot", "", "sp"];
+const QUALIFIER_ALIASES = { ga: "", final: "", release: "", incubating: "", cr: "rc" };
+// Everything isStable refuses must also RANK below the release, or a
+// catalog pinned to such a version can never graduate: its stable spelling
+// would read as a downgrade. Lone "a"/"b"/"m" are here for that reason —
+// Maven expands them to alpha/beta/milestone only when digits follow, and
+// ranks the lone spellings above the release as unknown qualifiers.
+const EXTRA_UNSTABLE = new Set([
+  "ea", "eap", "dev", "preview", "pre", "snap", "nightly", "canary", "build",
+  "a", "b", "m",
+]);
+const RELEASE_INDEX = String(QUALIFIERS.indexOf("")); // "5"
+
+// A lexically comparable key for a qualifier: known qualifiers order by
+// index, unknown ones lexically above every known one ("7-..."), and the
+// extended pre-release set between snapshot ("4") and the release ("5").
+const comparableQualifier = (q) => {
+  const i = QUALIFIERS.indexOf(q);
+  if (i !== -1) return String(i);
+  if (EXTRA_UNSTABLE.has(q)) return `4-${q}`;
+  return `${QUALIFIERS.length}-${q}`;
 };
 
-// Total order good enough for release versions: numeric tokens compare
-// numerically, alphanumerics lexically, and a version that is a prefix of a
-// longer one sorts below it ("1.1" < "1.1.1") — except that a trailing
-// pre-release token sorts BELOW the bare prefix ("1.1-rc1" < "1.1"), matching
-// Gradle. The stable-only filter upstream means the pre-release arm rarely
-// runs, but the comparator should not be wrong when it does.
-//
-// Release markers are dropped before comparing, because Maven and Gradle
-// rank them EQUAL to the bare release: "1.0.0.Final" == "1.0.0.RELEASE" ==
-// "1.0.0", so a synonymous spelling must never read as an upgrade — that
-// would swap artifacts while reporting an upward bump. ("SP1" keeps its
-// digit, so a service pack still ranks above its release.) Trailing zeros
-// are equivalent the same way — "1.0" == "1.0.0", "1.0-jre" == "1.0.0-jre"
-// — so each version's zero components are trimmed before comparing (see
-// compareTokens); the run-out zero checks below remain as a backstop for
-// shapes the trim does not produce.
-export const compareVersions = (a, b) => {
-  const ta = compareTokens(a);
-  const tb = compareTokens(b);
-  const len = Math.max(ta.length, tb.length);
-  for (let i = 0; i < len; i++) {
-    const x = ta[i];
-    const y = tb[i];
-    if (x === undefined) {
-      if (/^\d+$/.test(y)) {
-        if (!/^0+$/.test(y)) return -1;
-        continue; // "1.0" vs "1.0.0": the zero pads out equal
+// Items: a number is {n: canonicalDigitString}, a qualifier {q: string},
+// a sublist a plain array. Null items compare equal to a missing position.
+const numItem = (s) => ({ n: s.replace(/^0+(?=\d)/, "") });
+const strItem = (s, followedByDigit) => {
+  if (followedByDigit && s.length === 1) {
+    if (s === "a") s = "alpha";
+    else if (s === "b") s = "beta";
+    else if (s === "m") s = "milestone";
+  }
+  return { q: QUALIFIER_ALIASES[s] ?? s };
+};
+const isNullItem = (item) =>
+  Array.isArray(item)
+    ? item.length === 0
+    : item.n !== undefined
+      ? /^0+$/.test(item.n)
+      : comparableQualifier(item.q) === RELEASE_INDEX;
+
+// Maven's ListItem.normalize: walk back from the tail removing null items,
+// stop at the first non-null SCALAR — but keep walking past a non-null
+// sublist, which is how the zero leaves "1.1-0-jre" ([1,1,[[jre]]]) while
+// staying in "1.0.1".
+const normalizeList = (list) => {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const item = list[i];
+    if (isNullItem(item)) list.splice(i, 1);
+    else if (!Array.isArray(item)) break;
+  }
+};
+
+// Maven's parseVersion: '.' adds to the current list, '-' opens a sublist,
+// and a digit/letter transition acts as '-' — with the extra twist that a
+// qualifier arriving via '.' or at the end ALSO opens a sublist first
+// ("treat .X as -X"), while one arriving mid-list via letters-then-digit
+// splits into qualifier + nested digits.
+const parseMavenVersion = (version) => {
+  const v = String(version).toLowerCase();
+  const root = [];
+  const stack = [root];
+  let list = root;
+  let isDigit = false;
+  let start = 0;
+  const openSublist = () => {
+    const sub = [];
+    list.push(sub);
+    stack.push(sub);
+    list = sub;
+  };
+  for (let i = 0; i < v.length; i++) {
+    const c = v[i];
+    if (c === ".") {
+      list.push(i === start ? numItem("0") : parseFlush(v, start, i, isDigit));
+      start = i + 1;
+    } else if (c === "-" || c === "_" || c === "+") {
+      list.push(i === start ? numItem("0") : parseFlush(v, start, i, isDigit));
+      start = i + 1;
+      openSublist();
+    } else if (c >= "0" && c <= "9") {
+      if (!isDigit && i > start) {
+        if (list.length > 0) openSublist();
+        list.push(strItem(v.slice(start, i), true));
+        start = i;
+        openSublist();
       }
-      return UNSTABLE_TOKEN.test(y) ? 1 : -1;
+      isDigit = true;
+    } else {
+      if (isDigit && i > start) {
+        list.push(numItem(v.slice(start, i)));
+        start = i;
+        openSublist();
+      }
+      isDigit = false;
     }
-    if (y === undefined) {
-      if (/^\d+$/.test(x)) {
-        if (!/^0+$/.test(x)) return 1;
+  }
+  if (v.length > start) {
+    if (!isDigit && list.length > 0) openSublist();
+    list.push(parseFlush(v, start, v.length, isDigit));
+  }
+  while (stack.length > 0) normalizeList(stack.pop());
+  return root;
+};
+const parseFlush = (v, start, end, isDigit) =>
+  isDigit ? numItem(v.slice(start, end)) : strItem(v.slice(start, end), false);
+
+// A scalar item against a run-out position: a number counts as newer
+// unless zero; a qualifier decides by its rank against the release
+// ("1-rc" < "1", "1-jre" > "1").
+const scalarVsNull = (item) => {
+  if (item.n !== undefined) return /^0+$/.test(item.n) ? 0 : 1;
+  const c = comparableQualifier(item.q);
+  return c < RELEASE_INDEX ? -1 : c > RELEASE_INDEX ? 1 : 0;
+};
+
+// Maven's Item.compareTo across the three item kinds, null standing in for
+// a run-out position. Type order at the same position: number > sublist >
+// qualifier ("1.1 > 1-1 > 1-sp"). Iterative with an explicit frame stack:
+// nesting depth tracks the input's dash count, so a recursive walk would
+// overflow the call stack on an adversarial "1-1-1-…" spelling in
+// repository metadata. A list against a run-out position compares every
+// item to null (MNG-6964), which is a walk against the empty list.
+const compareItems = (l0, r0) => {
+  const frames = [{ l: l0, r: r0, i: 0 }];
+  while (frames.length > 0) {
+    const f = frames[frames.length - 1];
+    if (f.i >= f.l.length && f.i >= f.r.length) {
+      frames.pop();
+      continue;
+    }
+    const li = f.i < f.l.length ? f.l[f.i] : null;
+    const ri = f.i < f.r.length ? f.r[f.i] : null;
+    f.i++;
+    if (li === null && ri === null) continue;
+    if (li === null || ri === null) {
+      const present = li ?? ri;
+      const sign = li === null ? -1 : 1; // invert when the left ran out
+      if (Array.isArray(present)) {
+        frames.push(li === null ? { l: [], r: present, i: 0 } : { l: present, r: [], i: 0 });
         continue;
       }
-      return UNSTABLE_TOKEN.test(x) ? -1 : 1;
-    }
-    const nx = /^\d+$/.test(x);
-    const ny = /^\d+$/.test(y);
-    if (nx && ny) {
-      const c = compareNumeric(x, y);
+      const c = sign * scalarVsNull(present);
       if (c !== 0) return c;
-    } else if (nx !== ny) {
-      return nx ? 1 : -1; // numeric outranks qualifier at the same position
-    } else if (x !== y) {
-      return x < y ? -1 : 1;
+      continue;
     }
+    const lList = Array.isArray(li);
+    const rList = Array.isArray(ri);
+    if (lList && rList) {
+      frames.push({ l: li, r: ri, i: 0 });
+      continue;
+    }
+    if (lList) return ri.n !== undefined ? -1 : 1; // number > list > qualifier
+    if (rList) return li.n !== undefined ? 1 : -1;
+    if (li.n !== undefined && ri.n !== undefined) {
+      const c = compareNumeric(li.n, ri.n);
+      if (c !== 0) return c;
+      continue;
+    }
+    if (li.n !== undefined) return 1;
+    if (ri.n !== undefined) return -1;
+    const a = comparableQualifier(li.q);
+    const b = comparableQualifier(ri.q);
+    if (a !== b) return a < b ? -1 : 1;
   }
   return 0;
 };
+
+export const compareVersions = (a, b) =>
+  compareItems(parseMavenVersion(a), parseMavenVersion(b));
 
 // A version this tool can manage: a plain dotted release, no ranges, no `+`,
 // no rich-version object. Anything else is left alone and reported.
