@@ -89,12 +89,25 @@ Gradle only ever sees `contents: read`.
 
 Inputs (all optional): `catalog`, `cooldown-days`, `java-version`, `checks`
 (commands one per line, default `./gradlew test` + `./gradlew lint`),
+`review-checks` (commands one per line, default empty — see below),
 `commit-prefix` (default `internal:`, the Android repos' release-notes
 filter; the web repos use `deps:`), and `ci-workflow` (default
 `android-ci.yml`) — the consumer workflow dispatched against the pushed
 branch, needed because a PR opened by `GITHUB_TOKEN` triggers no
 `on: pull_request` workflows. It must carry `workflow_dispatch` with a `pr`
 input on the consumer's default branch; set it empty to disable.
+
+**`review-checks` flags a batch for a human** without failing it: any
+command exiting nonzero titles the PR `— NEEDS HUMAN REVIEW`, reports the
+outcome in a **Review** section, and leaves auto-merge unarmed, so the
+batch waits for a person even when every check is green. The motivating
+case is license metadata: a consumer whose CI regenerates a bundled-license
+list and fails on drift can pass that same regenerate-and-diff command
+here, and a batch that changes the license picture stops for review
+instead of landing unattended. Review checks run in the same untrusted
+window as the checks; tracked files they modify are diffed into the report
+as the thing the human reviews, then restored — they observe, they never
+publish.
 
 ## Testing
 
