@@ -17,15 +17,29 @@ import { readFileSync } from "node:fs";
 const workflow = readFileSync(".github/workflows/zizmor.yml", "utf8");
 const policy = readFileSync(".github/zizmor.yml", "utf8");
 
-// The policy minus its comments — full-line and inline both: the prose
-// explains the exemptions partly by naming the shapes they must NOT take,
-// and an entry written as `"foo/bar": ref-pin # rationale` must still be
-// collected, not hidden from the table comparison by its trailing comment.
-const policyRules = policy
-  .split("\n")
-  .map((line) => line.replace(/\s+#.*$/, ""))
-  .filter((line) => !line.trimStart().startsWith("#"))
-  .join("\n");
+// Strips YAML comments, full-line and inline both: the prose explains the
+// exemptions partly by naming the shapes they must NOT take, and an entry
+// written as `"foo/bar": ref-pin # rationale` must still be collected, not
+// hidden from the table comparison by its trailing comment. A function
+// rather than a constant so the inline branch can be proved on a fixture
+// below — the committed policy has no inline-commented entries to prove it
+// on.
+const stripComments = (text) =>
+  text
+    .split("\n")
+    .map((line) => line.replace(/\s+#.*$/, ""))
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n");
+
+const policyRules = stripComments(policy);
+
+// Every pin-policy entry in the text, quoted or not — YAML accepts both,
+// so a match that filtered by quoting style would let an unquoted key ride
+// in unseen.
+const policyEntries = (text) =>
+  [...text.matchAll(/^ {8}"?([^":\n]+?)"?: *(\S+)$/gm)].map(
+    (m) => `${m[1]}: ${m[2]}`,
+  );
 
 test("the scan pins the zizmor version exactly", () => {
   // An unpinned run takes whatever release is newest, and a new release
@@ -70,19 +84,24 @@ test("the scan re-runs when anything it scans changes", () => {
 test("the policy's pin table is exact", () => {
   // `@main` is the release for the enumerated sibling action, official
   // actions may pin tags, and the blanket hash-pin rule has to be restated
-  // because supplying policies replaces zizmor's defaults. Every entry is
-  // collected quoted or not — YAML accepts both, so a match that filtered
-  // by quoting style would let an unquoted key ride in unseen — and the
-  // table is compared whole: an entry added, dropped, or widened (say,
-  // mikelward/*) fails here, whichever shape it takes.
-  const entries = [
-    ...policyRules.matchAll(/^ {8}"?([^":\n]+?)"?: *(\S+)$/gm),
-  ].map((m) => `${m[1]}: ${m[2]}`);
-  assert.deepEqual(entries, [
+  // because supplying policies replaces zizmor's defaults. The table is
+  // compared whole: an entry added, dropped, or widened (say, mikelward/*)
+  // fails here, whichever shape it takes.
+  assert.deepEqual(policyEntries(policyRules), [
     "mikelward/codex-review: ref-pin",
     "actions/*: ref-pin",
     "*: hash-pin",
   ]);
+});
+
+test("the policy reader collects an entry hidden behind an inline comment", () => {
+  // The committed policy carries no inline-commented entries, so the
+  // stripping branch is proved on a fixture: were it dropped, an exemption
+  // written as `"o/r": ref-pin # rationale` would vanish from the table
+  // comparison instead of failing it, and the suite would stay green while
+  // the table check quietly stopped seeing such lines.
+  const fixture = '        "o/r": ref-pin # rationale';
+  assert.deepEqual(policyEntries(stripComments(fixture)), ["o/r: ref-pin"]);
 });
 
 test("the policy excuses the sweep's triggers for codex-review.yml alone", () => {
