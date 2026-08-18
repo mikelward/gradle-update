@@ -961,6 +961,21 @@ jobs:
               derived+=("$f")
               [ -f "$RUNNER_TEMP/regenerated/$f" ] \
                 || { echo "::error::The artifact is missing declared regenerated file: $f"; exit 1; }
+              # `-L`, not `-f`: a symlink to a regular file passes `-f` (it
+              # dereferences), which is exactly the shape that would slip
+              # past this check and into the `cp` below. A regenerated file
+              # is always meant to be a plain file — never legitimately a
+              # symlink — so refuse rather than try to preserve one: `cp`
+              # without `-P` follows a SOURCE symlink too, so restoring one
+              # would either copy through to whatever it points at inside
+              # this extraction directory (silently wrong content) or fail
+              # outright if that target doesn't exist there, while the
+              # fingerprint and `git add` below both read through the same
+              # symlink and would never see the file-type change.
+              if [ -L "$RUNNER_TEMP/regenerated/$f" ]; then
+                echo "::error::regenerated-files artifact carries a symlink, not a regular file: $f"
+                exit 1
+              fi
               # Remove the destination before copying: if the base
               # checkout holds $f as a SYMLINK, `cp` without this would
               # follow it and write the verified bytes through to
