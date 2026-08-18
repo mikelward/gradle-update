@@ -54,6 +54,18 @@ on:
         default: |
           ./gradlew test
           ./gradlew lint
+      review-checks:
+        description: >-
+          Commands that flag the batch for HUMAN review, one per line — the
+          consumer's license-drift check is the motivating case. They run
+          after the checks, in the same untrusted window; any nonzero exit
+          marks the PR "needs human review" (title and body) and leaves
+          auto-merge unarmed, without failing the batch. Tracked files a
+          review check modifies (a regenerated license list, say) are
+          diffed into the report and restored — review checks observe,
+          they never publish. Empty disables.
+        type: string
+        default: ''
       commit-prefix:
         description: >-
           Subject prefix for the batch commit and PR title. The Android repos
@@ -87,6 +99,7 @@ jobs:
     outputs:
       changed: ${{ steps.changed.outputs.changed }}
       passed: ${{ steps.checks.outputs.passed }}
+      review_flagged: ${{ steps.review.outputs.flagged }}
       base: ${{ steps.base.outputs.sha }}
       catalog_sha: ${{ steps.changed.outputs.catalog_sha }}
       engine_sha: ${{ steps.engine.outputs.sha }}
@@ -162,8 +175,8 @@ jobs:
           # as exact names AND as path prefixes. `..` leaves the repository,
           # which no consumer's catalog does.
           case "$CATALOG" in
-            ..|../*|report.md|checks.md|deps-stat.txt|handoff-catalog.toml|body.md|.jvm-update|.dependency-update|\
-            report.md/*|checks.md/*|deps-stat.txt/*|handoff-catalog.toml/*|body.md/*|.jvm-update/*|.dependency-update/*)
+            ..|../*|report.md|checks.md|review.md|deps-stat.txt|handoff-catalog.toml|body.md|.jvm-update|.dependency-update|\
+            report.md/*|checks.md/*|review.md/*|deps-stat.txt/*|handoff-catalog.toml/*|body.md/*|.jvm-update/*|.dependency-update/*)
               echo "::error::catalog path '$CATALOG' collides with a file or directory this workflow uses, or leaves the repository; choose a different catalog path."
               exit 1;;
           esac
@@ -175,7 +188,7 @@ jobs:
           # (`rm -rf`) would delete tracked content and the tree check would
           # abort every run on the deletions. Same answer: refuse with the
           # reason.
-          tracked=$(git ls-files -- report.md checks.md deps-stat.txt body.md handoff-catalog.toml .jvm-update .dependency-update)
+          tracked=$(git ls-files -- report.md checks.md review.md deps-stat.txt body.md handoff-catalog.toml .jvm-update .dependency-update)
           if [ -n "$tracked" ]; then
             echo "::error::this workflow writes scratch files at the workspace root that this repository tracks:"
             echo "$tracked"
@@ -288,6 +301,281 @@ jobs:
           : > "$GITHUB_PATH"
           : > "$GITHUB_ENV"
 
+      # Review checks decide whether a HUMAN looks before the batch lands —
+      # a nonzero exit flags the PR and holds auto-merge back, it does not
+      # fail the batch. They run in the same untrusted window and under the
+      # same containment as the checks. A review check may regenerate a
+      # tracked file to compare it (the license-drift case); what it changed
+      # is captured into the report as the thing the human reviews, then
+      # restored — after each command, so no later command can erase the
+      # evidence — and the tree check below still holds: nothing a review
+      # check produced can ride the artifact. Restoring is only sound when
+      # every tracked change is the review checks' own, so a tree the
+      # ordinary checks already dirtied is refused up front — the same stop
+      # the tree check would have delivered. The catalog itself is never
+      # restored here — a review check that touches it fails the fingerprint
+      # check below, as anything else would.
+      - name: Run the review checks
+        if: steps.changed.outputs.changed == 'true' && inputs.review-checks != ''
+        id: review
+        env:
+          REVIEW_CHECKS: ${{ inputs.review-checks }}
+          CATALOG: ${{ inputs.catalog }}
+          GIT_LITERAL_PATHSPECS: '1'
+        run: |
+          set -euo pipefail
+          # The restore below attributes every tracked modification to the
+          # review checks — which is only true if the tree was clean (bar
+          # the catalog) when they started. A tracked change the ORDINARY
+          # checks left would otherwise be restored away here, masking
+          # exactly what the tree check exists to stop. So that condition
+          # is enforced now, with the tree check's own answer: refuse.
+          # The same view the tree check uses — index, worktree, AND
+          # untracked files — because every shape matters here: a change
+          # the checks staged, left in the worktree, or dropped as a new
+          # untracked file could otherwise be laundered through the review
+          # step's restore before the tree check looks. (--no-renames so a
+          # rename never emits the two-field porcelain record this parsing
+          # does not read.) The run's own scratch files are the allowlist,
+          # as below.
+          treestate() {
+            git status --porcelain -z --untracked-files=all --no-renames \
+              | tr '\0' '\n' | sed '/^$/d' | sed 's/^...//' \
+              | grep -Fxv -e "$CATALOG" -e checks.md -e deps-stat.txt -e report.md || true
+          }
+          # review.md is NOT exempt at this gate: this step writes its
+          # report outside the workspace until the loop is done, so a
+          # workspace review.md here was left by an ordinary check — an
+          # unexpected file like any other. Refuse.
+          # IGNORED paths get the same pre-pass as the final tree check
+          # (same invocation, same allowlist): a review command could
+          # otherwise remove an ignored file the ordinary checks planted,
+          # erasing the evidence before that guard ever looks. The reports
+          # the run has already written are exempt by exact name — a
+          # consumer's .gitignore matching one reclassifies the workflow's
+          # own file as ignored — but review.md is NOT: nothing
+          # workflow-owned has written it yet.
+          pre=$(treestate)
+          preplanted=$(git status --porcelain -z --ignored \
+            | tr '\0' '\n' | sed '/^$/d' \
+            | grep '^!! ' \
+            | sed 's/^!! //' \
+            | grep -Ev '^((.*/)?\.gradle/|(.*/)?\.kotlin/|local\.properties$|(.*/)?build/)' \
+            | grep -Fxv -e report.md -e checks.md -e deps-stat.txt || true)
+          if [ -n "$pre" ] || [ -n "$preplanted" ]; then
+            echo '::error::The checks changed the tree outside the version catalog. Not opening a PR — inspect these first:'
+            if [ -n "$pre" ]; then echo "$pre"; fi
+            if [ -n "$preplanted" ]; then echo "$preplanted"; fi
+            exit 1
+          fi
+          flagged=0
+          # The report accumulates OUTSIDE the workspace and is copied in
+          # only after the last command: review commands run in the
+          # workspace, so one that cleans untracked files (`git clean`,
+          # say) could otherwise silently delete the evidence earlier
+          # commands left. A workspace review.md appearing DURING the loop
+          # is therefore a command's own doing — captured and restored
+          # like any other file.
+          REVIEW_TMP="$RUNNER_TEMP/review.md"
+          : > "$REVIEW_TMP"
+          # Two caps: 20,000 bytes per file AND a whole-report budget,
+          # because the PR body has a hard 65,536-character limit and a
+          # body that exceeds it fails to publish at all — which would
+          # hide the review evidence exactly when it matters. The budget
+          # is derived from what the REST of the body already spends —
+          # report.md, checks.md and deps-stat.txt all exist by now, plus
+          # 4,000 for the publish job's boilerplate — and never exceeds
+          # 40,000. Once it is spent, the remainder collapses to ONE
+          # closing line — a per-file notice each would itself grow
+          # without bound. The budget spans all commands: it bounds the
+          # report, not any one command's share of it.
+          # The reports written earlier in the run are finished products
+          # from here on; fingerprinted now so a review command that
+          # rewrites one (a broad formatter, say) is caught below rather
+          # than publishing command-controlled content under the
+          # workflow's name — or growing a file past the budget derived
+          # from its size.
+          reports_sha=$(sha256sum report.md checks.md deps-stat.txt)
+          other=$(( $(wc -c < report.md) + $(wc -c < checks.md) + $(wc -c < deps-stat.txt) ))
+          budget=$(( 65536 - 4000 - other ))
+          if [ "$budget" -gt 40000 ]; then budget=40000; fi
+          if [ "$budget" -lt 0 ]; then budget=0; fi
+          omitted=0
+          omittedcmds=0
+          # Capture $1's tree changes into review.md, then restore them —
+          # ONE COMMAND AT A TIME, so every command starts from the tree
+          # the ordinary checks left and a later command can neither
+          # overwrite nor quietly undo the evidence an earlier one left
+          # (a cleanup command restoring the regenerated license list
+          # would otherwise leave a flagged PR with nothing to review).
+          # The status view covers every shape a command can leave —
+          # staged, worktree, staged-then-reverted (index differs while
+          # the worktree matches HEAD), or a new untracked file; git diff
+          # HEAD alone misses the last two. Nothing is exempt: the report
+          # lives outside the workspace, so even a review.md a command
+          # drops is that command's own change, captured and restored.
+          capture_and_restore() {
+            changed=$(treestate)
+            if [ -z "$changed" ]; then
+              return 0
+            fi
+            # The heading carries the command text — check-controlled
+            # length — so it is charged with its fences as one unit before
+            # anything is emitted; once it no longer fits, this command's
+            # whole report collapses into the closing notice. The restore
+            # below runs regardless — only reporting is capped.
+            heading=$'\n'"What \`$1\` changed (restored after capture):"$'\n\n''```diff'
+            budget=$((budget - $(printf '%s\n' "$heading" | wc -c) - 4))
+            if [ "$budget" -ge 0 ]; then
+              printf '%s\n' "$heading" >> "$REVIEW_TMP"
+              reported=1
+            else
+              reported=0
+            fi
+            while IFS= read -r f; do
+              if [ "$reported" -eq 0 ] || [ "$budget" -le 0 ]; then
+                omitted=$((omitted + 1))
+                # No room in the report, but the evidence must still live
+                # somewhere a reviewer can reach: the step log takes the
+                # full diff — logs have no body limit.
+                echo "::group::omitted from the report — diff of $f"
+                git diff --cached --no-renames -- "$f"
+                git diff --no-renames -- "$f"
+                echo '::endgroup::'
+                continue
+              fi
+              # Both halves, because either can be empty while the other
+              # carries the change: index vs HEAD (--cached) and worktree
+              # vs index. Staged in a file OUTSIDE the workspace and
+              # truncated from there: `git diff | head -c` would take
+              # SIGPIPE on a large diff under pipefail and kill the step
+              # mid-restore.
+              {
+                git diff --cached --no-renames -- "$f"
+                git diff --no-renames -- "$f"
+              } > "$RUNNER_TEMP/review-diff"
+              size=$(wc -c < "$RUNNER_TEMP/review-diff")
+              # Every line this loop emits is charged against the budget,
+              # notices included: their lengths carry check-controlled
+              # filenames, so uncharged notices would grow the report
+              # without bound — the exact hole the budget closes.
+              if [ "$size" -eq 0 ]; then
+                note="new file added by a review check (content not shown): $f"
+                budget=$((budget - $(printf '%s\n' "$note" | wc -c)))
+                if [ "$budget" -lt 0 ]; then
+                  omitted=$((omitted + 1))
+                else
+                  printf '%s\n' "$note" >> "$REVIEW_TMP"
+                fi
+                continue
+              fi
+              take=$(( size < 20000 ? size : 20000 ))
+              if [ "$take" -gt "$budget" ]; then take=$budget; fi
+              if [ "$take" -gt 0 ]; then
+                head -c "$take" "$RUNNER_TEMP/review-diff" >> "$REVIEW_TMP"
+                budget=$((budget - take))
+              fi
+              if [ "$take" -lt "$size" ]; then
+                # Charged BEFORE emitting, like every other line: the
+                # notice carries the file's path, and a near-PATH_MAX name
+                # could otherwise overshoot the boilerplate reserve. When
+                # it does not fit, the closing notice covers it — the
+                # file counts as omitted.
+                note="… diff of $f truncated at $take of $size bytes (per-file and whole-report caps keep the PR body publishable) — the step log has it in full."
+                budget=$((budget - $(printf '\n%s\n' "$note" | wc -c)))
+                if [ "$budget" -ge 0 ]; then
+                  printf '\n%s\n' "$note" >> "$REVIEW_TMP"
+                else
+                  omitted=$((omitted + 1))
+                fi
+                echo "::group::truncated in the report — full diff of $f"
+                cat "$RUNNER_TEMP/review-diff"
+                echo '::endgroup::'
+              fi
+            done <<< "$changed"
+            if [ "$reported" -eq 1 ]; then
+              echo '```' >> "$REVIEW_TMP"
+            fi
+            # A path the review checks ADDED (or the add half of a rename)
+            # has nothing in HEAD to check out — restoring it means
+            # unstaging it and deleting the file, where a modified or
+            # deleted path restores from HEAD.
+            while IFS= read -r f; do
+              git reset -q -- "$f"
+              if git cat-file -e "HEAD:$f" 2>/dev/null; then
+                git checkout -q HEAD -- "$f"
+              else
+                rm -f -- "$f"
+              fi
+            done <<< "$changed"
+          }
+          # The whole loop runs fail-closed (set -e stays on): only each
+          # command's own exit is caught, because a nonzero there is the
+          # flag, not an error. The capture and restore are authoritative
+          # — a failure in them must go red, not fall through.
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::$cmd"
+            rc=0
+            ( export GITHUB_OUTPUT=/dev/null GITHUB_ENV=/dev/null \
+                GITHUB_PATH=/dev/null GITHUB_STEP_SUMMARY=/dev/null \
+                GITHUB_STATE=/dev/null
+              eval "$cmd" ) || rc=$?
+            echo '::endgroup::'
+            # The verdict line carries the command text too, so it is
+            # charged the same way; a line past the cap folds into the
+            # closing notice. The FLAG itself is never capped — flagged,
+            # the title, and the unarmed auto-merge are computed from rc,
+            # not from what the report had room to print.
+            if [ "$rc" -eq 0 ]; then
+              line="- ✅ \`$cmd\`"
+            else
+              line="- 🚩 \`$cmd\` (exit $rc) — human review requested"
+              flagged=1
+            fi
+            budget=$((budget - $(printf '%s\n' "$line" | wc -c)))
+            if [ "$budget" -ge 0 ]; then
+              printf '%s\n' "$line" >> "$REVIEW_TMP"
+            else
+              omittedcmds=$((omittedcmds + 1))
+            fi
+            capture_and_restore "$cmd"
+          done <<< "$REVIEW_CHECKS"
+          rm -f -- "$RUNNER_TEMP/review-diff"
+          if [ "$omitted" -gt 0 ] || [ "$omittedcmds" -gt 0 ]; then
+            {
+              echo
+              echo "… whole-report cap reached — omitted: $omittedcmds command result(s) and diffs of $omitted changed file(s); the step log carries every omitted diff in full."
+            } >> "$REVIEW_TMP"
+          fi
+          # The run's other reports live in the workspace, where a review
+          # command that cleans untracked files could have deleted them.
+          # That surfaces later as an opaque artifact failure — name the
+          # actual cause here instead.
+          for f in report.md checks.md deps-stat.txt; do
+            if [ ! -f "$f" ]; then
+              echo "::error::a review check deleted the run's own $f — fix the review-checks input; a review command must not touch the workflow's scratch files."
+              exit 1
+            fi
+          done
+          if [ "$(sha256sum report.md checks.md deps-stat.txt)" != "$reports_sha" ]; then
+            echo "::error::a review check modified the run's own reports — fix the review-checks input; a review command must not touch the workflow's scratch files."
+            exit 1
+          fi
+          # Only now does the report enter the workspace, after the last
+          # command has run and been restored.
+          cp -- "$REVIEW_TMP" review.md
+          cat review.md >> "$GITHUB_STEP_SUMMARY"
+          if [ $flagged -eq 0 ]; then
+            echo 'flagged=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'flagged=true' >> "$GITHUB_OUTPUT"
+          fi
+          # Same reasoning as the checks step: review checks ran dependency
+          # code, so discard anything they queued for later steps.
+          : > "$GITHUB_PATH"
+          : > "$GITHUB_ENV"
+
       # The checks above and the artifact below have to describe the SAME
       # tree. Anything outside the catalog is a stop, not something to strip
       # silently: a dependency that rewrites your source during a build is a
@@ -297,6 +585,7 @@ jobs:
         env:
           CATALOG: ${{ inputs.catalog }}
           CATALOG_SHA: ${{ steps.changed.outputs.catalog_sha }}
+          REVIEW_CHECKS: ${{ inputs.review-checks }}
         run: |
           set -euo pipefail
           # `git status`, not `git diff`: diff only sees tracked changes, so
@@ -309,10 +598,17 @@ jobs:
           # `-z` so git emits paths raw: its C-quoting of spaces and
           # non-ASCII would otherwise never equal the literal $CATALOG and
           # fail every publication under such a path.
+          allow=(-e "$CATALOG" -e checks.md -e deps-stat.txt -e report.md)
+          # review.md is workflow-owned only when review checks ran (that
+          # step creates it, after refusing a preexisting one). With review
+          # checks disabled nothing here writes it, so one appearing now is
+          # a check's doing — exempting it would ship that content into the
+          # PR body's Review section.
+          if [ -n "$REVIEW_CHECKS" ]; then allow+=(-e review.md); fi
           unexpected=$(git status --porcelain -z --untracked-files=all \
             | tr '\0' '\n' | sed '/^$/d' \
             | sed 's/^...//' \
-            | grep -Fxv -e "$CATALOG" -e checks.md -e deps-stat.txt -e report.md || true)
+            | grep -Fxv "${allow[@]}" || true)
           if [ -n "$unexpected" ]; then
             echo '::error::The batch touched files outside the version catalog. Not opening a PR — inspect these first:'
             echo "$unexpected"
@@ -323,12 +619,24 @@ jobs:
           # affordable; combined with --untracked-files=all it would list all
           # of ~/.gradle-scale noise file by file. The allowlist is Gradle's
           # own outputs; anything else ignored is something new in the tree
-          # and worth a human look.
+          # and worth a human look. The run's own scratch files are exempt
+          # by exact name: a consumer whose .gitignore happens to match one
+          # (a broad `*.md` rule, say) reclassifies the workflow's own
+          # report as ignored, and without the exemption every weekly run
+          # would abort on a file this job wrote itself. review.md is
+          # workflow-owned only when review checks ran, same rule as the
+          # untracked pass above — with them disabled, a gitignored
+          # review.md a check dropped must still stop the run, or it would
+          # ride the artifact into the PR body through the one pass that
+          # no longer sees it.
+          plantedallow=(-e report.md -e checks.md -e deps-stat.txt)
+          if [ -n "$REVIEW_CHECKS" ]; then plantedallow+=(-e review.md); fi
           planted=$(git status --porcelain -z --ignored \
             | tr '\0' '\n' | sed '/^$/d' \
             | grep '^!! ' \
             | sed 's/^!! //' \
-            | grep -Ev '^((.*/)?\.gradle/|(.*/)?\.kotlin/|local\.properties$|(.*/)?build/)' || true)
+            | grep -Ev '^((.*/)?\.gradle/|(.*/)?\.kotlin/|local\.properties$|(.*/)?build/)' \
+            | grep -Fxv "${plantedallow[@]}" || true)
           if [ -n "$planted" ]; then
             echo '::error::The batch left unexpected IGNORED files in the tree. Not opening a PR — inspect these first:'
             echo "$planted"
@@ -339,6 +647,9 @@ jobs:
             echo '::error::The catalog changed AFTER the engine resolved it — something in the check run rewrote it. Not opening a PR.'
             exit 1
           fi
+          # The artifact names review.md unconditionally; a run with no
+          # review checks configured still ships an empty one.
+          [ -f review.md ] || : > review.md
           # Stage the catalog for the artifact under a fixed literal name:
           # upload-artifact reads its path list as GLOB PATTERNS, so a
           # metacharacter in a custom catalog path ([, ?) could silently
@@ -359,6 +670,7 @@ jobs:
           path: |
             handoff-catalog.toml
             checks.md
+            review.md
             deps-stat.txt
             report.md
           retention-days: 1
@@ -416,7 +728,7 @@ jobs:
           CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
         run: |
           set -euo pipefail
-          mv -- .dependency-update/checks.md .dependency-update/deps-stat.txt .dependency-update/report.md .
+          mv -- .dependency-update/checks.md .dependency-update/review.md .dependency-update/deps-stat.txt .dependency-update/report.md .
           cp -- .dependency-update/handoff-catalog.toml "$CATALOG"
           rm -rf -- .dependency-update
           [ "$(sha256sum -- "$CATALOG" | cut -d' ' -f1)" = "$CATALOG_SHA" ] \
@@ -479,6 +791,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           # Env, not inline — see the fingerprint step.
           PASSED: ${{ needs.update.outputs.passed }}
+          REVIEW_FLAGGED: ${{ needs.update.outputs.review_flagged }}
           CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
         run: |
           set -euo pipefail
@@ -493,12 +806,18 @@ jobs:
           today=${created%%T*}
           branch="deps/update-$today"
 
-          if [ "$PASSED" = 'true' ]; then
-            title="$COMMIT_PREFIX Update dependencies ($today)"
-            verdict='All checks passed in the job that produced this branch.'
-          else
+          # A failing check outranks a review flag in the title: a red batch
+          # is broken first, reviewable second. Both are reported in full in
+          # the body either way, and EITHER condition holds auto-merge back.
+          if [ "$PASSED" != 'true' ]; then
             title="$COMMIT_PREFIX Update dependencies ($today) — CHECKS FAILING"
             verdict='**One or more checks failed.** Do not merge until they are fixed — the failures are real, not flakes to route around.'
+          elif [ "$REVIEW_FLAGGED" = 'true' ]; then
+            title="$COMMIT_PREFIX Update dependencies ($today) — NEEDS HUMAN REVIEW"
+            verdict='All checks passed, but a review check flagged this batch — see **Review** below. Auto-merge is deliberately not armed; merge by hand once the flagged change is acceptable.'
+          else
+            title="$COMMIT_PREFIX Update dependencies ($today)"
+            verdict='All checks passed in the job that produced this branch.'
           fi
 
           remote="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
@@ -544,6 +863,36 @@ jobs:
               validated_head=$(git rev-parse FETCH_HEAD)
               echo "Adopting existing branch $branch — base plus exactly the verified catalog (a rerun)." >> "$GITHUB_STEP_SUMMARY"
             else
+              # This run supersedes the earlier attempt: whatever armed
+              # the existing branch's PR was computed by an older run, and
+              # this run's verdict — a review flag the earlier attempt did
+              # not have, say — may be exactly what should hold that batch
+              # back. Disarm it before falling back, so an outdated arming
+              # cannot merge past today's result; the fallback PR below
+              # carries this run's own verdict and its own arming.
+              # Non-fatal — it errors when auto-merge was never armed.
+              oldpr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?head=${GITHUB_REPOSITORY_OWNER}:${branch}&state=open" \
+                --jq '[.[] | select(.base.ref == env.DEFAULT_BRANCH)][0].number // empty')
+              if [ -n "$oldpr" ]; then
+                # The disarm and the verify are separate on purpose:
+                # --disable-auto exits nonzero both when auto-merge was
+                # never armed (the common case, fine) and when the API
+                # call failed (an armed PR still armed — not fine), so
+                # the exit code proves nothing. Only reading the state
+                # back does, and a state that cannot be read or is still
+                # armed is a STOP: continuing would leave a superseded PR
+                # able to merge past this run's verdict.
+                gh pr merge --disable-auto "$oldpr" >/dev/null 2>&1 || true
+                armed=$(gh pr view "$oldpr" --json autoMergeRequest --jq '.autoMergeRequest != null') || {
+                  echo "::error::could not confirm the auto-merge state of superseded PR #$oldpr — not continuing while it may still be armed."
+                  exit 1
+                }
+                if [ "$armed" != 'false' ]; then
+                  echo "::error::auto-merge on superseded PR #$oldpr could not be disarmed — not continuing while it is armed."
+                  exit 1
+                fi
+                echo "Auto-merge on PR #$oldpr is confirmed disarmed — its branch is superseded by this run." >> "$GITHUB_STEP_SUMMARY"
+              fi
               branch="$branch-run${{ github.run_number }}-${{ github.run_attempt }}"
               echo "Today's branch already exists with different content; using $branch instead." >> "$GITHUB_STEP_SUMMARY"
             fi
@@ -593,9 +942,21 @@ jobs:
           # is still editing the body would otherwise merge on an arming
           # this attempt never made. From here to the arming at the bottom,
           # the PR has no auto-merge at all; the passing path re-arms it,
-          # pinned to the validated head. Non-fatal — it errors when
-          # auto-merge was never armed, which is the common case.
+          # pinned to the validated head. Same disarm-then-verify shape as
+          # the superseded-branch case above: --disable-auto's exit code
+          # cannot distinguish "was never armed" from "API call failed",
+          # so only reading the state back proves the PR is unarmed — and
+          # an unconfirmable or still-armed state is a stop, because this
+          # run may be about to decide the batch must NOT merge.
           gh pr merge --disable-auto "$pr" >/dev/null 2>&1 || true
+          armed=$(gh pr view "$pr" --json autoMergeRequest --jq '.autoMergeRequest != null') || {
+            echo "::error::could not confirm the auto-merge state of PR #$pr — not continuing while a stale arming may survive."
+            exit 1
+          }
+          if [ "$armed" != 'false' ]; then
+            echo "::error::a stale auto-merge on PR #$pr could not be disarmed — not continuing while it is armed."
+            exit 1
+          fi
 
           ci_started=false
           if [ -n "$CI_WORKFLOW" ]; then
@@ -617,6 +978,12 @@ jobs:
             echo
             cat checks.md
             echo
+            if [ -s review.md ]; then
+              echo '## Review'
+              echo
+              cat review.md
+              echo
+            fi
             echo "$verdict"
             echo
             if [ "$ci_started" = true ]; then
@@ -672,9 +1039,11 @@ jobs:
           # consumer whose ruleset requires little (or whose CI dispatch
           # failed, leaving nothing red on the PR) would otherwise merge a
           # batch this very workflow titled CHECKS FAILING. A failing batch
-          # stays open, assigned, and waits for a human. Non-fatal: repos
-          # without auto-merge allowed just fall back to manual.
-          if [ "$PASSED" = 'true' ]; then
+          # stays open, assigned, and waits for a human — and so does a
+          # review-flagged one: "needs human review" means no unattended
+          # merge, whatever the checks said. Non-fatal: repos without
+          # auto-merge allowed just fall back to manual.
+          if [ "$PASSED" = 'true' ] && [ "$REVIEW_FLAGGED" != 'true' ]; then
             # Any stale arming was cleared right after the PR was identified,
             # so the only arming that can exist after this line is one bound
             # to the exact commit this run validated (the adopted FETCH_HEAD
@@ -691,6 +1060,12 @@ jobs:
             # No arming here, and none survives from before: a prior
             # attempt's request was cleared before CI was dispatched, so the
             # required checks going green cannot merge a PR titled
-            # CHECKS FAILING.
-            echo 'Checks failed, so auto-merge was deliberately not armed (and any earlier arming was cleared).' >> "$GITHUB_STEP_SUMMARY"
+            # CHECKS FAILING. The summary names which condition held it
+            # back — a review flag is not a failure, and saying "failed"
+            # for it would send whoever reads the run down the wrong path.
+            if [ "$PASSED" != 'true' ]; then
+              echo 'Checks failed, so auto-merge was deliberately not armed (and any earlier arming was cleared).' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo 'A review check flagged this batch for human review, so auto-merge was deliberately not armed (and any earlier arming was cleared).' >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
