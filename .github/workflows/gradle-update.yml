@@ -370,6 +370,16 @@ jobs:
               report.md|checks.md|deps-stat.txt|review.md|body.md|regen-stat.txt|handoff-catalog.toml|handoff-regenerated.tar)
                 echo "::error::regenerated-files must not name the run's own scratch file: $f"
                 exit 1 ;;
+              .dependency-update|.dependency-update/*)
+                # The publish job's artifact staging directory: it copies a
+                # verified regenerated file OUT of here by this same name,
+                # then `rm -rf`s the whole directory before the commit is
+                # staged. A tracked path under this prefix would get
+                # written here, deleted by that cleanup, and then
+                # committed as a deletion — the exact bytes just verified,
+                # discarded by the job that exists to publish them.
+                echo "::error::regenerated-files must not name a path under .dependency-update/ — that is the publish job's own staging directory: $f"
+                exit 1 ;;
             esac
             if [ "$f" = "$CATALOG" ]; then
               echo '::error::regenerated-files must not name the catalog — the engine owns it.'
@@ -951,6 +961,14 @@ jobs:
               derived+=("$f")
               [ -f "$RUNNER_TEMP/regenerated/$f" ] \
                 || { echo "::error::The artifact is missing declared regenerated file: $f"; exit 1; }
+              # Remove the destination before copying: if the base
+              # checkout holds $f as a SYMLINK, `cp` without this would
+              # follow it and write the verified bytes through to
+              # whatever it points at, leaving the symlink itself (and
+              # whatever it names) unchanged — the fingerprint check below
+              # would then pass by reading through the same symlink, and
+              # `git add` would stage no change at all.
+              rm -f -- "$f"
               cp -- "$RUNNER_TEMP/regenerated/$f" "$f"
               rm -- "$RUNNER_TEMP/regenerated/$f"
             done <<< "$REGENERATED_FILES"
@@ -1102,11 +1120,8 @@ jobs:
             # compares literally.)
             diff_paths=$(git diff -z --name-only HEAD FETCH_HEAD | tr '\0' '\n' | sed '/^$/d')
             # The catalog must be in the diff, and everything else in it
-            # must be a declared regenerated file whose FETCH_HEAD content
-            # matches the fingerprint this run verified — the same bytes
-            # vouched for above, just already on the branch. Any other
-            # path, or a stale regeneration from an older attempt, refuses
-            # adoption and takes a fresh branch.
+            # must be a declared regenerated file — nothing unexpected may
+            # have moved.
             paths_ok=true
             printf '%s\n' "$diff_paths" | grep -Fxq -- "$CATALOG" || paths_ok=false
             while IFS= read -r p; do
@@ -1116,17 +1131,31 @@ jobs:
                 paths_ok=false
                 break
               fi
-              want=''
-              while IFS= read -r line; do
-                [ -z "$line" ] && continue
-                if [ "${line#*  }" = "$p" ]; then want=${line%%  *}; fi
-              done <<< "$REGEN_SHA"
-              if [ -z "$want" ] \
-                 || [ "$(git show "FETCH_HEAD:$p" 2>/dev/null | sha256sum | cut -d' ' -f1)" != "$want" ]; then
-                paths_ok=false
-                break
-              fi
             done <<< "$diff_paths"
+            # Every DECLARED regenerated file must match what THIS run
+            # fingerprinted — checked against the full declaration, not
+            # against diff_paths above. A file an EARLIER attempt left
+            # unchanged from the base is absent from that diff, but a
+            # `regenerate` command that reads external or time-dependent
+            # data can still produce different bytes on THIS run; without
+            # checking every declared path independently, that stale,
+            # never-verified copy already on the branch would be adopted
+            # anyway.
+            if [ "$paths_ok" = true ] && [ -n "$REGEN_SHA" ]; then
+              while IFS= read -r p; do
+                [ -z "$p" ] && continue
+                want=''
+                while IFS= read -r line; do
+                  [ -z "$line" ] && continue
+                  if [ "${line#*  }" = "$p" ]; then want=${line%%  *}; fi
+                done <<< "$REGEN_SHA"
+                if [ -z "$want" ] \
+                   || [ "$(git show "FETCH_HEAD:$p" 2>/dev/null | sha256sum | cut -d' ' -f1)" != "$want" ]; then
+                  paths_ok=false
+                  break
+                fi
+              done <<< "$REGENERATED_FILES"
+            fi
             if [ "$paths_ok" = true ] \
                && [ "$(git rev-list --count HEAD..FETCH_HEAD)" = "1" ] \
                && [ "$(git log -1 --format=%B FETCH_HEAD)" = "$title" ] \
@@ -1248,6 +1277,30 @@ jobs:
             else
               echo "Could not start CI on $branch; the PR body says so." >> "$GITHUB_STEP_SUMMARY"
             fi
+          fi
+
+          # regen-stat.txt is the one piece of this body with no size
+          # guarantee: report.md, checks.md, review.md and deps-stat.txt are
+          # each bounded by the batch's own shape (review.md by its own
+          # budget above), but regen-stat.txt scales with how many files a
+          # consumer declares in regenerated-files — arbitrarily large from
+          # this workflow's point of view. Cap it against whatever space is
+          # actually left, so a large declaration can never push body.md
+          # past GitHub's 65,536-character limit; without this, `gh pr edit`
+          # fails all three retries below, the PR keeps its placeholder
+          # body, and — since PASSED/REVIEW_FLAGGED are unaffected — the
+          # auto-merge arm at the bottom still fires on it regardless.
+          other=$(( $(wc -c < report.md) + $(wc -c < checks.md) \
+                     + $(wc -c < review.md) + $(wc -c < deps-stat.txt) ))
+          regen_budget=$(( 65536 - 6000 - other ))
+          if [ "$regen_budget" -lt 0 ]; then regen_budget=0; fi
+          if [ "$(wc -c < regen-stat.txt)" -gt "$regen_budget" ]; then
+            head -c "$regen_budget" regen-stat.txt > "$RUNNER_TEMP/regen-stat.trunc"
+            {
+              echo
+              echo "… truncated — the full diffstat is $(wc -c < regen-stat.txt) bytes; see this pull request's own Files Changed tab for the complete regenerated-file diff."
+            } >> "$RUNNER_TEMP/regen-stat.trunc"
+            mv -- "$RUNNER_TEMP/regen-stat.trunc" regen-stat.txt
           fi
 
           {
