@@ -91,6 +91,29 @@ costing maintenance:
   `settings.gradle.kts`, compiler versions read from build files) are
   reported as unmanaged, never updated. Managing them means parsing
   Kotlin script, which is out of scope on purpose.
+- **`regenerate` runs after `checks`, not before.** A regenerate command
+  that rewrites something the checks exercise (generated source a test
+  imports, say — not the license-inventory-style derived file the input
+  is meant for) means `checks.md`'s `passed` verdict, and the PR title
+  and verdict text built from it, describe the PRE-regeneration tree, not
+  the one actually committed. The real safety property survives this: the
+  dispatched `ci-workflow` run and the ruleset's required checks (see the
+  gate above) test the ACTUAL pushed branch, post-regeneration, so
+  auto-merge still waits on real coverage of what's committed — but only
+  once that ruleset requirement is actually in place, which is the same
+  unverified prerequisite the gate item above already tracks. Independent
+  of that, the body's own "All checks passed" text is misleading for this
+  specific case regardless of the ruleset. Closing it means a genuine
+  trade-off a human should pick: reorder `regenerate` before `checks`
+  (touches the fingerprint-ordering assumptions the tree checks and
+  reports_sha_before rely on throughout the update job, and the
+  pre-regenerate dirty-tree check would need to guard a different set of
+  earlier steps instead), or re-run `checks` again after `regenerate` and
+  AND the two verdicts together (correct, but doubles check wall-clock
+  for every consumer using `regenerate`, and needs `PASSED` rewired
+  everywhere it's currently read from the single `checks` step). Neither
+  is a small change to make unreviewed in the same pass that introduced
+  `regenerate`.
 
 ## Review and merge gates
 
