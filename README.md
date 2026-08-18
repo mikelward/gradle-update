@@ -91,6 +91,14 @@ jobs:
 The called workflow downscopes those permissions per job; the job that runs
 Gradle only ever sees `contents: read`.
 
+**A new consumer also needs a repository setting**, not just this caller
+file: Settings → Actions → General → Workflow permissions → "Allow GitHub
+Actions to create and approve pull requests." Without it, `gh pr create` in
+the publish job fails with "GitHub Actions is not permitted to create or
+approve pull requests" — `pull-requests: write` above scopes what the
+*token* can do, but this setting is the separate, repo-level gate on
+whether Actions may open pull requests at all, and it defaults to off.
+
 Inputs (all optional): `catalog`, `cooldown-days`, `java-version`, `checks`
 (commands one per line, default `./gradlew test` + `./gradlew lint`),
 `review-checks` (commands one per line, default empty — see below),
