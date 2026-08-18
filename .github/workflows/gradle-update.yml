@@ -1204,7 +1204,19 @@ jobs:
             exit 1
           fi
 
-      - name: Open the pull request
+      # Split from the step below purely on size: a single `run:` block is a
+      # YAML scalar node, and GitHub Actions caps any one node at 21,000
+      # characters — this step's adopt-or-commit-and-push logic plus the PR
+      # composition that used to follow it together cleared that limit,
+      # which fails the ENTIRE workflow_call at dispatch time (a parse
+      # error, before any job runs) rather than failing one step. The split
+      # point is a real seam: this half decides the branch name and either
+      # adopts an existing one or commits and pushes a new one; the next
+      # half only opens/updates the PR. What crosses the boundary — branch,
+      # title, verdict, validated_head — travels as step outputs, the same
+      # channel `passed` already rides.
+      - name: Resolve the branch, then adopt or commit and push
+        id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
           CATALOG: ${{ inputs.catalog }}
@@ -1215,7 +1227,6 @@ jobs:
           # Data, not script text — a quote or $() in a consumer's input must
           # never change what this write-enabled job executes.
           COMMIT_PREFIX: ${{ inputs.commit-prefix }}
-          CI_WORKFLOW: ${{ inputs.ci-workflow }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           # Env, not inline — see the fingerprint step.
           PASSED: ${{ needs.update.outputs.passed }}
@@ -1459,6 +1470,35 @@ jobs:
             git push "$remote" "HEAD:refs/heads/$branch"
             validated_head=$(git rev-parse HEAD)
           fi
+
+          # branch/title/verdict/validated_head are plain single-line text —
+          # the fixed set this workflow itself ever produces, none of it
+          # carrying a newline — so the simple `key=value` form is safe;
+          # nothing here needs a heredoc.
+          {
+            echo "branch=$branch"
+            echo "title=$title"
+            echo "verdict=$verdict"
+            echo "validated_head=$validated_head"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_WORKFLOW: ${{ inputs.ci-workflow }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PASSED: ${{ needs.update.outputs.passed }}
+          REVIEW_FLAGGED: ${{ needs.update.outputs.review_flagged }}
+          RESOLVED_BRANCH: ${{ steps.resolve.outputs.branch }}
+          RESOLVED_TITLE: ${{ steps.resolve.outputs.title }}
+          RESOLVED_VERDICT: ${{ steps.resolve.outputs.verdict }}
+          RESOLVED_HEAD: ${{ steps.resolve.outputs.validated_head }}
+        run: |
+          set -euo pipefail
+          branch="$RESOLVED_BRANCH"
+          title="$RESOLVED_TITLE"
+          verdict="$RESOLVED_VERDICT"
+          validated_head="$RESOLVED_HEAD"
 
           # A PR opened by GITHUB_TOKEN triggers no `on: pull_request`
           # workflows, so nothing would start CI on this branch by itself.
