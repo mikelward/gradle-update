@@ -3,7 +3,7 @@ name: Dependency update
 # One batched Gradle dependency PR per week, as a REUSABLE workflow — the JVM
 # sibling of npm-update, consumed with:
 #
-#   uses: mikelward/gradle-update/.github/workflows/dependency-update.yml@main
+#   uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main
 #
 # from a small caller workflow that owns the cron. See README.md for the
 # caller shape and the permissions it must grant.
@@ -1006,7 +1006,7 @@ jobs:
             echo '```'
             echo
             echo '---'
-            echo '_Opened by the weekly dependency-update workflow (mikelward/gradle-update)._'
+            echo '_Opened by the weekly gradle-update workflow._'
           } > body.md
 
           # A transient API failure here must not strand the PR on its

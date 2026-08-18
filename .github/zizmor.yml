@@ -21,7 +21,7 @@ rules:
         # them instead is a deliberate open question — see the zizmor
         # entry in mikelward/codex-review's TODO.md.
         "actions/*": ref-pin
-        # Everything else must pin to a hash, as dependency-update.yml
+        # Everything else must pin to a hash, as gradle-update.yml
         # already does.
         "*": hash-pin
   dangerous-triggers:
