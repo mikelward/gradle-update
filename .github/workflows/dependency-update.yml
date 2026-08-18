@@ -296,6 +296,7 @@ jobs:
         if: steps.changed.outputs.changed == 'true'
         env:
           CATALOG: ${{ inputs.catalog }}
+          CATALOG_SHA: ${{ steps.changed.outputs.catalog_sha }}
         run: |
           set -euo pipefail
           # `git status`, not `git diff`: diff only sees tracked changes, so
@@ -334,7 +335,7 @@ jobs:
             exit 1
           fi
           # Nothing may have touched the catalog since the engine rewrote it.
-          if [ "$(sha256sum -- "$CATALOG" | cut -d' ' -f1)" != '${{ steps.changed.outputs.catalog_sha }}' ]; then
+          if [ "$(sha256sum -- "$CATALOG" | cut -d' ' -f1)" != "$CATALOG_SHA" ]; then
             echo '::error::The catalog changed AFTER the engine resolved it — something in the check run rewrote it. Not opening a PR.'
             exit 1
           fi
@@ -406,12 +407,19 @@ jobs:
       - name: Check the artifact against the pre-check fingerprint
         env:
           CATALOG: ${{ inputs.catalog }}
+          # Update-job outputs enter every run block in this job through env,
+          # never inline: `${{ }}` expands into the script BEFORE bash runs,
+          # so an output forged on the update runner (the file-command
+          # channel its checks step documents as closable only casually)
+          # would otherwise become code under this job's write token. As env
+          # it is data, and a forged value is bounded to a failed comparison.
+          CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
         run: |
           set -euo pipefail
           mv -- .dependency-update/checks.md .dependency-update/deps-stat.txt .dependency-update/report.md .
           cp -- .dependency-update/handoff-catalog.toml "$CATALOG"
           rm -rf -- .dependency-update
-          [ "$(sha256sum -- "$CATALOG" | cut -d' ' -f1)" = '${{ needs.update.outputs.catalog_sha }}' ] \
+          [ "$(sha256sum -- "$CATALOG" | cut -d' ' -f1)" = "$CATALOG_SHA" ] \
             || { echo '::error::The catalog does not match what the update job resolved.'; exit 1; }
 
       - name: Fetch the validator
@@ -442,6 +450,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           # Data, not script text — an apostrophe is legal in a git ref name.
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Env, not inline — see the fingerprint step.
+          BASE: ${{ needs.update.outputs.base }}
         run: |
           set -euo pipefail
           # Percent-encoded: the argument is a URL path, and characters like
@@ -449,8 +459,8 @@ jobs:
           # reason.
           encoded=$(printf %s "$DEFAULT_BRANCH" | jq -sRr @uri)
           current=$(gh api "repos/${{ github.repository }}/commits/$encoded" --jq .sha)
-          if [ "$current" != '${{ needs.update.outputs.base }}' ]; then
-            echo "::error::$DEFAULT_BRANCH moved from ${{ needs.update.outputs.base }} to $current while the checks ran, so the verified catalog and the branch it would land on no longer match. Re-run the workflow."
+          if [ "$current" != "$BASE" ]; then
+            echo "::error::$DEFAULT_BRANCH moved from $BASE to $current while the checks ran, so the verified catalog and the branch it would land on no longer match. Re-run the workflow."
             exit 1
           fi
 
@@ -467,6 +477,9 @@ jobs:
           COMMIT_PREFIX: ${{ inputs.commit-prefix }}
           CI_WORKFLOW: ${{ inputs.ci-workflow }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Env, not inline — see the fingerprint step.
+          PASSED: ${{ needs.update.outputs.passed }}
+          CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
         run: |
           set -euo pipefail
           # Keyed on the RUN's date: the job runs weekly, so a month-scoped
@@ -480,7 +493,7 @@ jobs:
           today=${created%%T*}
           branch="deps/update-$today"
 
-          if [ '${{ needs.update.outputs.passed }}' = 'true' ]; then
+          if [ "$PASSED" = 'true' ]; then
             title="$COMMIT_PREFIX Update dependencies ($today)"
             verdict='All checks passed in the job that produced this branch.'
           else
@@ -523,7 +536,7 @@ jobs:
             if [ "$diff_paths" = "$CATALOG" ] \
                && [ "$(git rev-list --count HEAD..FETCH_HEAD)" = "1" ] \
                && [ "$(git log -1 --format=%B FETCH_HEAD)" = "$title" ] \
-               && [ "$(git show "FETCH_HEAD:$CATALOG" 2>/dev/null | sha256sum | cut -d' ' -f1)" = '${{ needs.update.outputs.catalog_sha }}' ]; then
+               && [ "$(git show "FETCH_HEAD:$CATALOG" 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$CATALOG_SHA" ]; then
               adopt=true
               # The exact commit adoption vouched for — auto-merge below is
               # bound to it, so a push landing after this fingerprint cannot
@@ -661,7 +674,7 @@ jobs:
           # batch this very workflow titled CHECKS FAILING. A failing batch
           # stays open, assigned, and waits for a human. Non-fatal: repos
           # without auto-merge allowed just fall back to manual.
-          if [ '${{ needs.update.outputs.passed }}' = 'true' ]; then
+          if [ "$PASSED" = 'true' ]; then
             # Any stale arming was cleared right after the PR was identified,
             # so the only arming that can exist after this line is one bound
             # to the exact commit this run validated (the adopted FETCH_HEAD
