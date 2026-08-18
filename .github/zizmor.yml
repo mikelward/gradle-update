@@ -9,10 +9,14 @@ rules:
   unpinned-uses:
     config:
       policies:
-        # `@main` IS the release channel for the codex-review action and
-        # for this repository's own reusable workflow: there is no release
-        # step, and a pin would be a thing to bump in every consumer.
-        "mikelward/*": ref-pin
+        # `@main` IS the release for this sibling action: consumers track
+        # it deliberately, there is no release step, and a pin would be a
+        # thing to bump in every consumer. Enumerated by name, not
+        # `mikelward/*` — owner-wide would also excuse a future workflow
+        # pulling any sibling at a mutable ref, and each exemption should
+        # be a decision somebody made. Adding one is one line here, plus
+        # the table in zizmor.test.js.
+        "mikelward/codex-review": ref-pin
         # Official actions may pin to a tag, as ci.yml does. Hash-pinning
         # them instead is a deliberate open question — see the zizmor
         # entry in mikelward/codex-review's TODO.md.
