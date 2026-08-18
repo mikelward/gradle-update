@@ -1323,8 +1323,16 @@ jobs:
                   [ -z "$line" ] && continue
                   if [ "${line#* }" = "$p" ]; then want=${line%% *}; fi
                 done <<< "$REGEN_HASH"
+                # --filters, not `git show`: `want` was fingerprinted from
+                # the actual checked-out working-tree bytes, which a
+                # consumer's .gitattributes (eol=crlf, a custom clean/smudge
+                # filter) can differ from the raw blob `git show` reads.
+                # `--filters` reproduces the same conversion a checkout
+                # would apply, so it compares like with like; `git show`
+                # would refuse an identical, correctly-regenerated file on
+                # every rerun for a repo with such an attribute.
                 if [ -z "$want" ] \
-                   || [ "$(git show "FETCH_HEAD:$p" 2>/dev/null | sha256sum | cut -d' ' -f1)" != "$want" ]; then
+                   || [ "$(git cat-file --filters "FETCH_HEAD:$p" 2>/dev/null | sha256sum | cut -d' ' -f1)" != "$want" ]; then
                   paths_ok=false
                   break
                 fi
@@ -1352,10 +1360,13 @@ jobs:
                 fi
               done <<< "$REGENERATED_FILES"
             fi
+            # --filters here too: CATALOG_SHA was fingerprinted from the
+            # engine's checked-out working-tree write, same as the
+            # regenerated-files fingerprints above — see that comment.
             if [ "$paths_ok" = true ] \
                && [ "$(git rev-list --count HEAD..FETCH_HEAD)" = "1" ] \
                && [ "$(git log -1 --format=%B FETCH_HEAD)" = "$title" ] \
-               && [ "$(git show "FETCH_HEAD:$CATALOG" 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$CATALOG_SHA" ]; then
+               && [ "$(git cat-file --filters "FETCH_HEAD:$CATALOG" 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$CATALOG_SHA" ]; then
               adopt=true
               # The exact commit adoption vouched for — auto-merge below is
               # bound to it, so a push landing after this fingerprint cannot
