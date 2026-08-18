@@ -125,6 +125,7 @@ jobs:
       passed: ${{ steps.checks.outputs.passed }}
       review_flagged: ${{ steps.review.outputs.flagged }}
       regen_sha: ${{ steps.regen.outputs.files_sha }}
+      regen_hash: ${{ steps.regen.outputs.files_hash }}
       regen_mode: ${{ steps.regen.outputs.files_mode }}
       base: ${{ steps.base.outputs.sha }}
       catalog_sha: ${{ steps.changed.outputs.catalog_sha }}
@@ -365,6 +366,17 @@ jobs:
             echo '::error::regenerate is set but regenerated-files is empty — declare the files the commands rebuild.'
             exit 1
           fi
+          # A duplicate survives the tree check (both entries name the same
+          # real change) but not the publish job's restore: it extracts the
+          # tar'd artifact once per declared entry, removing each source
+          # after copying it out, so the second occurrence of the same path
+          # finds nothing left to copy and the run aborts.
+          dupes=$(printf '%s\n' "${files[@]}" | sort | uniq -d)
+          if [ -n "$dupes" ]; then
+            echo "::error::regenerated-files lists the same path more than once:"
+            echo "$dupes"
+            exit 1
+          fi
           for f in "${files[@]}"; do
             # Canonicalized the same way the catalog is: every later
             # comparison against this path — the tree check's allowlist,
@@ -448,6 +460,30 @@ jobs:
             echo 'files_sha<<REGEN_SHA_EOF'
             sha256sum -- "${files[@]}"
             echo 'REGEN_SHA_EOF'
+          } >> "$GITHUB_OUTPUT"
+          # A second, deliberately NOT-sha256sum-formatted copy for the
+          # rerun-adoption loop's per-path lookup below: a filename holding
+          # a backslash or newline makes sha256sum itself switch to an
+          # escaped line (a leading `\`, `\\`/`\n` inside the name) — fine
+          # for `sha256sum -c`, which decodes its own format, but a hand
+          # lookup keyed on the raw path would never match the escaped
+          # spelling and silently refuse an adoptable branch forever. The
+          # hash is always exactly 64 hex characters, so splitting on the
+          # first space is unambiguous without any escaping at all.
+          {
+            echo 'files_hash<<REGEN_HASH_EOF'
+            for f in "${files[@]}"; do
+              # A leading `\` marks the escaped-filename form; strip it
+              # before taking the hash, which is everything up to the
+              # first space either way.
+              line=$(sha256sum -- "$f")
+              line=${line#\\}
+              # printf, not echo: `sh`'s echo, unlike bash's default, does
+              # interpret backslash sequences in a filename like `\n` —
+              # printf never does, so the line stays the raw path.
+              printf '%s %s\n' "${line%% *}" "$f"
+            done
+            echo 'REGEN_HASH_EOF'
           } >> "$GITHUB_OUTPUT"
           # A regeneration command can flip a declared file's executable bit
           # without touching a byte of content — a chmod, not a rewrite —
@@ -1164,6 +1200,7 @@ jobs:
           CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
           REGENERATED_FILES: ${{ inputs.regenerated-files }}
           REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
+          REGEN_HASH: ${{ needs.update.outputs.regen_hash }}
           REGEN_MODE: ${{ needs.update.outputs.regen_mode }}
         run: |
           set -euo pipefail
@@ -1250,10 +1287,19 @@ jobs:
               while IFS= read -r p; do
                 [ -z "$p" ] && continue
                 want=''
+                # REGEN_HASH, not REGEN_SHA: a declared path containing a
+                # backslash or newline makes sha256sum switch to its own
+                # escaped line form (leading `\`, `\\`/`\n` inside the
+                # name) — fine for `sha256sum -c` elsewhere, which decodes
+                # it, but this hand lookup would never match the escaped
+                # spelling and refuse an adoptable branch every time.
+                # REGEN_HASH pairs each raw path with its hash alone, split
+                # unambiguously on the first space since the hash is always
+                # exactly 64 hex characters.
                 while IFS= read -r line; do
                   [ -z "$line" ] && continue
-                  if [ "${line#*  }" = "$p" ]; then want=${line%%  *}; fi
-                done <<< "$REGEN_SHA"
+                  if [ "${line#* }" = "$p" ]; then want=${line%% *}; fi
+                done <<< "$REGEN_HASH"
                 if [ -z "$want" ] \
                    || [ "$(git show "FETCH_HEAD:$p" 2>/dev/null | sha256sum | cut -d' ' -f1)" != "$want" ]; then
                   paths_ok=false
