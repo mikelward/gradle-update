@@ -157,7 +157,7 @@ jobs:
         with:
           repository: mikelward/gradle-update
           ref: main
-          path: .jvm-update
+          path: .gradle-update
           persist-credentials: false
 
       # One immutable revision for the whole run: the publish job checks the
@@ -165,7 +165,7 @@ jobs:
       # the batch under different rules than resolved it.
       - name: Record the engine revision
         id: engine
-        run: echo "sha=$(git -C .jvm-update rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git -C .gradle-update rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # Reads Maven metadata over HTTPS and rewrites [versions] in place.
       # No dependency code executes here — that starts with the Gradle
@@ -204,9 +204,9 @@ jobs:
           # as exact names AND as path prefixes. `..` leaves the repository,
           # which no consumer's catalog does.
           case "$CATALOG" in
-            ..|../*|report.md|checks.md|review.md|deps-stat.txt|handoff-catalog.toml|body.md|.jvm-update|.dependency-update|\
+            ..|../*|report.md|checks.md|review.md|deps-stat.txt|handoff-catalog.toml|body.md|.gradle-update|.dependency-update|\
             regen-stat.txt|handoff-regenerated.tar|\
-            report.md/*|checks.md/*|review.md/*|deps-stat.txt/*|handoff-catalog.toml/*|body.md/*|.jvm-update/*|.dependency-update/*|\
+            report.md/*|checks.md/*|review.md/*|deps-stat.txt/*|handoff-catalog.toml/*|body.md/*|.gradle-update/*|.dependency-update/*|\
             regen-stat.txt/*|handoff-regenerated.tar/*)
               echo "::error::catalog path '$CATALOG' collides with a file or directory this workflow uses, or leaves the repository; choose a different catalog path."
               exit 1;;
@@ -219,20 +219,20 @@ jobs:
           # (`rm -rf`) would delete tracked content and the tree check would
           # abort every run on the deletions. Same answer: refuse with the
           # reason.
-          tracked=$(git ls-files -- report.md checks.md review.md deps-stat.txt body.md handoff-catalog.toml .jvm-update .dependency-update regen-stat.txt handoff-regenerated.tar)
+          tracked=$(git ls-files -- report.md checks.md review.md deps-stat.txt body.md handoff-catalog.toml .gradle-update .dependency-update regen-stat.txt handoff-regenerated.tar)
           if [ -n "$tracked" ]; then
             echo "::error::this workflow writes scratch files at the workspace root that this repository tracks:"
             echo "$tracked"
             echo '::error::rename or move those files to run the weekly update.'
             exit 1
           fi
-          node .jvm-update/update-versions.mjs \
+          node .gradle-update/update-versions.mjs \
             --catalog "$CATALOG" \
             --cooldown-days "$COOLDOWN_DAYS" \
             --markdown report.md
           # The engine has done its work; removing it keeps the tree check
           # below simple and honest.
-          rm -rf .jvm-update
+          rm -rf .gradle-update
 
       - name: Stop early if nothing moved
         id: changed
@@ -396,12 +396,12 @@ jobs:
                 # discarded by the job that exists to publish them.
                 echo "::error::regenerated-files must not name a path under .dependency-update/ — that is the publish job's own staging directory: $f"
                 exit 1 ;;
-              .jvm-update|.jvm-update/*)
+              .gradle-update|.gradle-update/*)
                 # Same collision, different job: the update job's "Fetch the
                 # validator" step checks the validator repo out here, then
                 # `rm -rf`s it once the checks finish — after a regenerated
                 # file restored under this prefix would already be deleted.
-                echo "::error::regenerated-files must not name a path under .jvm-update/ — that is the validator checkout's own directory: $f"
+                echo "::error::regenerated-files must not name a path under .gradle-update/ — that is the validator checkout's own directory: $f"
                 exit 1 ;;
             esac
             if [ "$f" = "$CATALOG" ]; then
@@ -1102,7 +1102,7 @@ jobs:
           # The exact revision the update job resolved with — never a moving
           # ref, so the batch is validated under the same rules that made it.
           ref: ${{ needs.update.outputs.engine_sha }}
-          path: .jvm-update
+          path: .gradle-update
           persist-credentials: false
 
       # The authoritative check on what this commit contains, and the reason
@@ -1122,9 +1122,9 @@ jobs:
           COOLDOWN_DAYS: ${{ inputs.cooldown-days }}
         run: |
           set -euo pipefail
-          node .jvm-update/check-gradle-update.mjs \
+          node .gradle-update/check-gradle-update.mjs \
             --catalog "$CATALOG" --verify-upstream --cooldown-days "$COOLDOWN_DAYS"
-          rm -rf .jvm-update
+          rm -rf .gradle-update
 
       - name: Stop if the default branch moved while the checks ran
         env:
