@@ -768,32 +768,26 @@ jobs:
               omittedcmds=$((omittedcmds + 1))
             fi
             # A flagging command's own output is the REASON a human is
-            # being asked to look — a license check names the exact entry
-            # that changed — so it goes into the report, charged against
-            # the same budget as the diffs and under the same per-item
-            # cap. The step log above already carries it in full. Green
-            # commands stay quiet: their output is progress noise, and
-            # the ✅ line says everything the body needs.
+            # being asked to look, but it is NOT safe to copy here: this
+            # command ran in the same untrusted window as `regenerate`, and
+            # its output was captured to review-out by REDIRECTING the
+            # subshell's stdout straight to a file — bytes that never pass
+            # through the runner's own log-capture pipeline. GitHub's
+            # secret masking scrubs THAT pipeline (which is why the `cat`
+            # above shows `***` for a registered secret in the step log),
+            # not arbitrary files a step writes; review-out itself is the
+            # raw, unmasked bytes. review.md is committed into a public PR
+            # body, so copying review-out there would publish anything the
+            # command printed — a token it read from the environment,
+            # included. Point at the step log instead, which already
+            # carries the full output AND the real redaction. Green
+            # commands stay quiet: their output is progress noise, and the
+            # ✅ line says everything the body needs.
             if [ "$rc" -ne 0 ] && [ -s "$RUNNER_TEMP/review-out" ]; then
-              heading=$'\n'"What \`$cmd\` reported:"$'\n\n''```'
-              size=$(wc -c < "$RUNNER_TEMP/review-out")
-              take=$(( size < 20000 ? size : 20000 ))
-              if [ "$take" -gt "$budget" ]; then take=$budget; fi
-              charge=$(( $(printf '%s\n' "$heading" | wc -c) + take + 4 ))
-              if [ "$take" -gt 0 ] && [ "$budget" -ge "$charge" ]; then
-                budget=$((budget - charge))
-                printf '%s\n' "$heading" >> "$REVIEW_TMP"
-                head -c "$take" -- "$RUNNER_TEMP/review-out" >> "$REVIEW_TMP"
-                printf '\n```\n' >> "$REVIEW_TMP"
-                if [ "$take" -lt "$size" ]; then
-                  note="… output truncated at $take of $size bytes — the step log has it in full."
-                  budget=$((budget - $(printf '%s\n' "$note" | wc -c)))
-                  if [ "$budget" -ge 0 ]; then
-                    printf '%s\n' "$note" >> "$REVIEW_TMP"
-                  else
-                    omitted=$((omitted + 1))
-                  fi
-                fi
+              note="What \`$cmd\` reported: see the step log above — its output is not copied into this report, since GitHub only redacts registered secrets in the log, not in files this job writes."
+              budget=$((budget - $(printf '%s\n' "$note" | wc -c) - 1))
+              if [ "$budget" -ge 0 ]; then
+                printf '\n%s\n' "$note" >> "$REVIEW_TMP"
               else
                 omitted=$((omitted + 1))
               fi
