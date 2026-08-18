@@ -17,11 +17,13 @@ import { readFileSync } from "node:fs";
 const workflow = readFileSync(".github/workflows/zizmor.yml", "utf8");
 const policy = readFileSync(".github/zizmor.yml", "utf8");
 
-// The policy minus its comments: the prose explains the exemptions partly
-// by naming the shapes they must NOT take, so pattern assertions have to
-// read only the lines zizmor does.
+// The policy minus its comments — full-line and inline both: the prose
+// explains the exemptions partly by naming the shapes they must NOT take,
+// and an entry written as `"foo/bar": ref-pin # rationale` must still be
+// collected, not hidden from the table comparison by its trailing comment.
 const policyRules = policy
   .split("\n")
+  .map((line) => line.replace(/\s+#.*$/, ""))
   .filter((line) => !line.trimStart().startsWith("#"))
   .join("\n");
 
