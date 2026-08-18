@@ -1427,6 +1427,35 @@ jobs:
               done <<< "$REGENERATED_FILES"
             fi
             git commit -q -m "$title"
+            # Verify what was actually just committed, not just what was
+            # staged: a Git attribute like `ident` is not round-trip-safe —
+            # its smudge output embeds the blob's own hash, which only
+            # exists once the commit does, so a checkout of what was just
+            # committed can differ from what regeneration fingerprinted
+            # even though nothing tampered with anything in between. Same
+            # comparisons the rerun-adoption loop above already makes,
+            # applied to the commit about to be pushed instead of an
+            # existing branch's FETCH_HEAD: a stop here, not a silent push
+            # of content nothing actually verified end to end.
+            if [ "$(git cat-file --filters "HEAD:$CATALOG" | sha256sum | cut -d' ' -f1)" != "$CATALOG_SHA" ]; then
+              echo '::error::The committed catalog does not match what the update job fingerprinted — refusing to push unverified content.'
+              exit 1
+            fi
+            if [ -n "$REGEN_HASH" ]; then
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                want=''
+                while IFS= read -r line; do
+                  [ -z "$line" ] && continue
+                  if [ "${line#* }" = "$f" ]; then want=${line%% *}; fi
+                done <<< "$REGEN_HASH"
+                if [ -z "$want" ] \
+                   || [ "$(git cat-file --filters "HEAD:$f" | sha256sum | cut -d' ' -f1)" != "$want" ]; then
+                  echo "::error::The committed file '$f' does not match what regeneration fingerprinted — refusing to push unverified content."
+                  exit 1
+                fi
+              done <<< "$REGENERATED_FILES"
+            fi
             git push "$remote" "HEAD:refs/heads/$branch"
             validated_head=$(git rev-parse HEAD)
           fi
