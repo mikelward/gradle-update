@@ -101,6 +101,16 @@ branch, needed because a PR opened by `GITHUB_TOKEN` triggers no
 `on: pull_request` workflows. It must carry `workflow_dispatch` with a `pr`
 input on the consumer's default branch; set it empty to disable.
 
+**Unattended landing needs the ruleset to require branches up to date**
+(strict required status checks). The publish job verifies that policy
+before arming auto-merge and falls back to a manual merge without it:
+auto-merge can fire long after the run's own base-freshness check, and
+the head-pinned arming closes only the arming-time race, not a later base
+advance. The strict policy closes the rest — a moved base blocks the merge
+until someone with write access updates the branch, and the merged tree
+must then pass the required checks again — so the ruleset must require the
+consumer's real CI for that revalidation to mean anything.
+
 **`review-checks` flags a batch for a human** without failing it: any
 command exiting nonzero titles the PR `— NEEDS HUMAN REVIEW`, reports the
 outcome in a **Review** section, and leaves auto-merge unarmed, so the
