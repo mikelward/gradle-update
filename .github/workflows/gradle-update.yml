@@ -428,6 +428,35 @@ jobs:
               exit 1
             }
           done
+          # Before any regenerate command runs: the checks above already ran
+          # unreviewed dependency and plugin code, same as here, and could
+          # have left the tree dirty. Two things go wrong without this gate.
+          # A regenerate command that resets its own working state first (a
+          # "clean build" doing `git checkout -- .` or `git clean`, an
+          # ordinary thing to write) would silently erase that evidence
+          # before the tree check at the end of this job ever sees it. And a
+          # declared file the checks modified — left untouched by a no-op or
+          # incremental regeneration — would be fingerprinted and committed
+          # as though the regenerate commands produced it, when nothing
+          # here actually vouches for it. Same shape as the pre-check the
+          # review-checks step below runs, exempting only the catalog and
+          # the reports already written by earlier steps — not the declared
+          # files, since regeneration has not run yet to earn that.
+          pretree=$(git status --porcelain -z --untracked-files=all --no-renames \
+            | tr '\0' '\n' | sed '/^$/d' | sed 's/^...//' \
+            | grep -Fxv -e "$CATALOG" -e report.md -e checks.md -e deps-stat.txt || true)
+          preplanted=$(git status --porcelain -z --ignored \
+            | tr '\0' '\n' | sed '/^$/d' \
+            | grep '^!! ' \
+            | sed 's/^!! //' \
+            | grep -Ev '^((.*/)?\.gradle/|(.*/)?\.kotlin/|local\.properties$|(.*/)?build/)' \
+            | grep -Fxv -e report.md -e checks.md -e deps-stat.txt || true)
+          if [ -n "$pretree" ] || [ -n "$preplanted" ]; then
+            echo '::error::The checks changed the tree outside the version catalog before regeneration ran. Not opening a PR — inspect these first:'
+            if [ -n "$pretree" ]; then echo "$pretree"; fi
+            if [ -n "$preplanted" ]; then echo "$preplanted"; fi
+            exit 1
+          fi
           # Fingerprinted before the regenerate commands run, verified after:
           # report.md and deps-stat.txt already exist by now (written by
           # earlier steps) and checks.md is complete, but nothing before this
