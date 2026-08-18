@@ -638,7 +638,10 @@ test("a partial repository outage holds the affected key and resolves the rest",
   });
   assert.ok(!report.changes.some((c) => c.key === "coreKtx"));
   assert.ok(report.errors.some((e) => e.includes("incomplete metadata")));
-  assert.ok(report.changes.some((c) => c.key === "lifecycle")); // clean keys still resolve
+  const lifecycle = report.changes.find((c) => c.key === "lifecycle");
+  assert.ok(lifecycle); // clean keys still resolve
+  // Each change names the modules its key pins, for the PR-body report.
+  assert.ok(lifecycle.modules.some((m) => `${m.group}:${m.artifact}`.includes("lifecycle")));
 });
 
 test("a repository outage reads as errors, never as an empty version list", async () => {
@@ -687,15 +690,38 @@ test("dotted catalog aliases are parsed and updated like any other", async () =>
 
 test("reportMarkdown covers every section and the empty run", () => {
   const md = reportMarkdown({
-    changes: [{ key: "a", from: "1.0", to: "1.1" }],
-    held: [{ key: "b", from: "1.0", newest: "2.0" }],
-    cooldown: [{ key: "c", from: "1.0", to: null, reasons: ["1.1: inside the window"] }],
+    changes: [{ key: "a", from: "1.0", to: "1.1", modules: [{ group: "g", artifact: "x" }] }],
+    held: [
+      {
+        key: "b",
+        from: "1.0",
+        newest: "2.0",
+        modules: [
+          { group: "g", artifact: "y" },
+          { group: "g", artifact: "z" },
+        ],
+      },
+    ],
+    cooldown: [
+      {
+        key: "c",
+        from: "1.0",
+        to: null,
+        reasons: ["1.1: inside the window"],
+        modules: [{ group: "g", artifact: "w" }],
+      },
+    ],
     unmanaged: ["version d: no library or plugin references it"],
     errors: ["https://repo/x: HTTP 503"],
   });
   for (const expected of ["## Updated", "## Held back", "## Deferred", "## Not managed", "## Repository errors"]) {
     assert.ok(md.includes(expected), expected);
   }
+  // The Maven coordinates ride each entry — the catalog alias alone doesn't
+  // say what moved, and a shared key names every module it pins.
+  assert.ok(md.includes("- `a` (g:x): 1.0 → 1.1"), md);
+  assert.ok(md.includes("- `b` (g:y, g:z): 1.0 stays; 2.0 needs a deliberate migration"), md);
+  assert.ok(md.includes("- `c` (g:w) stays at 1.0:"), md);
   assert.equal(
     reportMarkdown({ changes: [], held: [], cooldown: [], unmanaged: [], errors: [] }).trim(),
     "No dependency updates available this run.",

@@ -822,16 +822,16 @@ export const updateCatalog = async (
       },
     );
     if (decision.to !== null) {
-      changes.push({ key, from: value, to: decision.to, line, quote });
+      changes.push({ key, from: value, to: decision.to, line, quote, modules });
     }
     if (decision.heldMajor !== null) {
-      held.push({ key, from: value, newest: decision.heldMajor });
+      held.push({ key, from: value, newest: decision.heldMajor, modules });
     }
     if (decision.cooldownSkipped > 0) {
       // Reported even when an older candidate was taken instead — "took
       // 1.2.2, 1.2.3 is cooling down" is exactly what the reviewer of the
       // weekly PR wants to know.
-      cooldown.push({ key, from: value, to: decision.to, reasons: decision.reasons });
+      cooldown.push({ key, from: value, to: decision.to, reasons: decision.reasons, modules });
     }
   }
 
@@ -847,18 +847,27 @@ export const updateCatalog = async (
 
 // Markdown for the PR body: what moved, what a major is holding, what the
 // cooldown deferred, what this tool does not manage. Small and stable so the
-// weekly diff of the PR body itself stays readable.
+// weekly diff of the PR body itself stays readable. Each entry names the
+// Maven coordinates its key pins — the catalog alias alone doesn't tell the
+// reviewer WHAT moved, and a shared key legitimately pins several modules.
+const moduleNames = (modules) =>
+  (modules ?? []).map((m) => `${m.group}:${m.artifact}`).join(", ");
+
 export const reportMarkdown = (report) => {
   const lines = [];
   if (report.changes.length > 0) {
     lines.push("## Updated", "");
-    for (const c of report.changes) lines.push(`- \`${c.key}\`: ${c.from} → ${c.to}`);
+    for (const c of report.changes) {
+      lines.push(`- \`${c.key}\` (${moduleNames(c.modules)}): ${c.from} → ${c.to}`);
+    }
     lines.push("");
   }
   if (report.held.length > 0) {
     lines.push("## Held back — new major available", "");
     for (const h of report.held) {
-      lines.push(`- \`${h.key}\`: ${h.from} stays; ${h.newest} needs a deliberate migration`);
+      lines.push(
+        `- \`${h.key}\` (${moduleNames(h.modules)}): ${h.from} stays; ${h.newest} needs a deliberate migration`,
+      );
     }
     lines.push("");
   }
@@ -867,8 +876,8 @@ export const reportMarkdown = (report) => {
     for (const c of report.cooldown) {
       lines.push(
         c.to === null
-          ? `- \`${c.key}\` stays at ${c.from}:`
-          : `- \`${c.key}\` took ${c.to}, newer releases are cooling down:`,
+          ? `- \`${c.key}\` (${moduleNames(c.modules)}) stays at ${c.from}:`
+          : `- \`${c.key}\` (${moduleNames(c.modules)}) took ${c.to}, newer releases are cooling down:`,
       );
       for (const r of c.reasons) lines.push(`  - ${r}`);
     }
