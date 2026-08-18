@@ -24,7 +24,7 @@
 // work the trust split already allows here, and closes that reach-back.
 //
 // validateCatalogUpdate is a pure function over the two file texts, exported
-// for check-versions-update.test.js; verifyUpstream is pure but for the
+// for check-gradle-update.test.js; verifyUpstream is pure but for the
 // injected fetcher and clock. The CLI at the bottom is the only part that
 // touches git, the filesystem, or the network.
 

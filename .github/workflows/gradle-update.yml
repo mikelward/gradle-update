@@ -11,7 +11,7 @@ name: Dependency update
 # update-versions.mjs moves every entry in gradle/libs.versions.toml to the
 # newest stable release WITHIN ITS CURRENT MAJOR, so a direct dependency
 # cannot cross a major: the publish job re-derives that from the diff
-# (check-versions-update.mjs) and stops the run if one did. Majors stay a
+# (check-gradle-update.mjs) and stops the run if one did. Majors stay a
 # deliberate, human-initiated migration.
 #
 # Beneath the catalog the promise is weaker than npm-update's: these repos
@@ -1000,7 +1000,7 @@ jobs:
           COOLDOWN_DAYS: ${{ inputs.cooldown-days }}
         run: |
           set -euo pipefail
-          node .jvm-update/check-versions-update.mjs \
+          node .jvm-update/check-gradle-update.mjs \
             --catalog "$CATALOG" --verify-upstream --cooldown-days "$COOLDOWN_DAYS"
           rm -rf .jvm-update
 

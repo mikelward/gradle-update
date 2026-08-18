@@ -117,7 +117,7 @@ check() {
 # --- classify: the rule itself, both directions per shape
 check "markdown-only diff is docs"        0 "docs_only=true"  FILES="README.md AGENTS.md"
 check "code file makes it code"           0 "docs_only=false" FILES="README.md update-versions.mjs"
-check "the validator is code"             0 "docs_only=false" FILES="check-versions-update.mjs"
+check "the validator is code"             0 "docs_only=false" FILES="check-gradle-update.mjs"
 check ".gitignore is code like any config" 0 "docs_only=false" FILES=".gitignore README.md"
 check "a shared head never rides the docs lane" 0 "docs_only=false" FILES="README.md" SHARED_PRS="1 2"
 check "a lone foreign head PR never rides the lane" 0 "docs_only=false" FILES="README.md" SHARED_PRS="2"

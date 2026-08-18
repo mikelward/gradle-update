@@ -4,7 +4,7 @@
 
 Autopilot guesses (2026-08-17), recorded so they get a human look:
 
-- **The publish job now runs `check-versions-update.mjs --verify-upstream`**,
+- **The publish job now runs `check-gradle-update.mjs --verify-upstream`**,
   re-asking the repositories that each new version exists (for every module
   sharing its key) outside the cooldown. Rationale: the artifact and its
   fingerprint originate on the runner that executed the batch's Gradle code,
@@ -16,7 +16,7 @@ Autopilot guesses (2026-08-17), recorded so they get a human look:
   by rough headroom over expected runtimes, not measurement. A consumer whose
   Gradle checks legitimately exceed 90 minutes needs the number raised.
 - **`ci.yml` actions are now SHA-pinned** (checkout v5.0.1, setup-node
-  v6.5.0) to match `dependency-update.yml`'s convention. Undoing is
+  v6.5.0) to match `gradle-update.yml`'s convention. Undoing is
   reverting to the tags.
 
 ## Alternatives considered and parked

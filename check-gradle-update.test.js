@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateCatalogUpdate, verifyUpstream } from "./check-versions-update.mjs";
+import { validateCatalogUpdate, verifyUpstream } from "./check-gradle-update.mjs";
 
 const CATALOG = [
   "# comment",

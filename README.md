@@ -53,7 +53,7 @@ batch *do* execute dependency and plugin code, so:
   before Gradle runs, truncates `$GITHUB_PATH`/`$GITHUB_ENV` afterwards, and
   verifies nothing outside the catalog changed — ignored paths included;
 - the **publish job** runs on a fresh runner, executes no dependency code,
-  re-validates the diff from a clean context (`check-versions-update.mjs`:
+  re-validates the diff from a clean context (`check-gradle-update.mjs`:
   only in-place, in-major, stable, upward version bumps in `[versions]`
   pass), re-asks the repositories that every new version exists for every
   module sharing its key with a publish date outside the cooldown (the
@@ -116,7 +116,7 @@ publish.
 ## Testing
 
 ```
-node --test update-versions.test.js check-versions-update.test.js
+node --test update-versions.test.js check-gradle-update.test.js
 ```
 
 No install step: the engine and its suite are dependency-free on purpose, so
