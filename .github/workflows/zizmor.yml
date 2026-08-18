@@ -1,0 +1,34 @@
+# Advisory scan of the workflows with zizmor (https://docs.zizmor.sh).
+#
+# Advisory MEANS advisory: the ruleset does not require this check, on
+# purpose. Running it fetches zizmor from PyPI, and a registry outage must
+# not stall a merge gate — the same reasoning that keeps PyYAML
+# uninstalled in codex-review's check-consumer.yml. A red run here is a
+# finding to read, not a gate.
+#
+# The version is pinned because a new zizmor release adds audits, so an
+# unpinned run could turn red with no change in this repository. Bump it
+# deliberately and re-read the findings. The policy exceptions live in
+# .github/zizmor.yml, beside this file.
+name: zizmor
+on:
+  push:
+    branches: [main]
+    paths: ['.github/**']
+  pull_request:
+    paths: ['.github/**']
+permissions:
+  contents: read
+jobs:
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      # --offline, so the scan talks to nothing: the audits that need the
+      # GitHub API are skipped, deterministically, and the only fetch is
+      # zizmor itself.
+      - name: Scan the workflows
+        run: pipx run --spec zizmor==1.29.0 zizmor --no-progress --offline .
