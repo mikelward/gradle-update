@@ -63,7 +63,7 @@ is the part that is actually verified.
 ## Consuming it
 
 A consumer keeps one small caller workflow, e.g.
-`.github/workflows/dependency-update.yml`:
+`.github/workflows/gradle-update.yml`:
 
 ```yaml
 name: Dependency update
@@ -73,11 +73,11 @@ on:
   workflow_dispatch:
 permissions: {}
 concurrency:
-  group: dependency-update
+  group: gradle-update
   cancel-in-progress: false
 jobs:
   update:
-    uses: mikelward/gradle-update/.github/workflows/dependency-update.yml@main
+    uses: mikelward/gradle-update/.github/workflows/gradle-update.yml@main
     permissions:
       contents: write
       pull-requests: write
