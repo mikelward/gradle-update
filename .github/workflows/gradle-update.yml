@@ -125,6 +125,7 @@ jobs:
       passed: ${{ steps.checks.outputs.passed }}
       review_flagged: ${{ steps.review.outputs.flagged }}
       regen_sha: ${{ steps.regen.outputs.files_sha }}
+      regen_mode: ${{ steps.regen.outputs.files_mode }}
       base: ${{ steps.base.outputs.sha }}
       catalog_sha: ${{ steps.changed.outputs.catalog_sha }}
       engine_sha: ${{ steps.engine.outputs.sha }}
@@ -204,7 +205,9 @@ jobs:
           # which no consumer's catalog does.
           case "$CATALOG" in
             ..|../*|report.md|checks.md|review.md|deps-stat.txt|handoff-catalog.toml|body.md|.jvm-update|.dependency-update|\
-            report.md/*|checks.md/*|review.md/*|deps-stat.txt/*|handoff-catalog.toml/*|body.md/*|.jvm-update/*|.dependency-update/*)
+            regen-stat.txt|handoff-regenerated.tar|\
+            report.md/*|checks.md/*|review.md/*|deps-stat.txt/*|handoff-catalog.toml/*|body.md/*|.jvm-update/*|.dependency-update/*|\
+            regen-stat.txt/*|handoff-regenerated.tar/*)
               echo "::error::catalog path '$CATALOG' collides with a file or directory this workflow uses, or leaves the repository; choose a different catalog path."
               exit 1;;
           esac
@@ -216,7 +219,7 @@ jobs:
           # (`rm -rf`) would delete tracked content and the tree check would
           # abort every run on the deletions. Same answer: refuse with the
           # reason.
-          tracked=$(git ls-files -- report.md checks.md review.md deps-stat.txt body.md handoff-catalog.toml .jvm-update .dependency-update)
+          tracked=$(git ls-files -- report.md checks.md review.md deps-stat.txt body.md handoff-catalog.toml .jvm-update .dependency-update regen-stat.txt handoff-regenerated.tar)
           if [ -n "$tracked" ]; then
             echo "::error::this workflow writes scratch files at the workspace root that this repository tracks:"
             echo "$tracked"
@@ -393,6 +396,13 @@ jobs:
                 # discarded by the job that exists to publish them.
                 echo "::error::regenerated-files must not name a path under .dependency-update/ — that is the publish job's own staging directory: $f"
                 exit 1 ;;
+              .jvm-update|.jvm-update/*)
+                # Same collision, different job: the update job's "Fetch the
+                # validator" step checks the validator repo out here, then
+                # `rm -rf`s it once the checks finish — after a regenerated
+                # file restored under this prefix would already be deleted.
+                echo "::error::regenerated-files must not name a path under .jvm-update/ — that is the validator checkout's own directory: $f"
+                exit 1 ;;
             esac
             if [ "$f" = "$CATALOG" ]; then
               echo '::error::regenerated-files must not name the catalog — the engine owns it.'
@@ -438,6 +448,20 @@ jobs:
             echo 'files_sha<<REGEN_SHA_EOF'
             sha256sum -- "${files[@]}"
             echo 'REGEN_SHA_EOF'
+          } >> "$GITHUB_OUTPUT"
+          # A regeneration command can flip a declared file's executable bit
+          # without touching a byte of content — a chmod, not a rewrite —
+          # and content-only fingerprints have nothing to say about it.
+          # git's own two-state mode (100644 / 100755, the only distinction
+          # it stores for a regular file) is what a later `git add` will
+          # actually record, so that is what gets fingerprinted and later
+          # verified, not raw filesystem permission bits.
+          {
+            echo 'files_mode<<REGEN_MODE_EOF'
+            for f in "${files[@]}"; do
+              if [ -x "$f" ]; then echo "100755 $f"; else echo "100644 $f"; fi
+            done
+            echo 'REGEN_MODE_EOF'
           } >> "$GITHUB_OUTPUT"
           git diff --stat -- "${files[@]}" >> "$GITHUB_STEP_SUMMARY"
           # Plugin code ran above; discard anything it queued for later
@@ -790,6 +814,7 @@ jobs:
           # declared files — every regenerated-file exemption below keys
           # off that, never off the declaration alone.
           REGEN_SHA: ${{ steps.regen.outputs.files_sha }}
+          REGEN_MODE: ${{ steps.regen.outputs.files_mode }}
         run: |
           set -euo pipefail
           # `git status`, not `git diff`: diff only sees tracked changes, so
@@ -868,6 +893,25 @@ jobs:
           if [ -n "$REGEN_SHA" ]; then
             printf '%s\n' "$REGEN_SHA" | sha256sum -c --strict --quiet \
               || { echo '::error::A regenerated file changed AFTER the regenerate step fingerprinted it — something in the review run rewrote it. Not opening a PR.'; exit 1; }
+            # A content-only fingerprint has nothing to say about a chmod:
+            # the bytes match, and the tree checks above deliberately treat
+            # a declared regenerated file as expected-to-differ, so a
+            # review check flipping the executable bit alone would
+            # otherwise ride straight through both checks. Same fingerprint
+            # discipline, one bit of state instead of a hash.
+            while IFS= read -r mode_line; do
+              [ -z "$mode_line" ] && continue
+              # Split only the fixed "MODE " prefix — `read` would trim
+              # leading/trailing spaces from a filename, silently missing a
+              # mismatch for a declared path that has any.
+              want_mode=${mode_line%% *}
+              f=${mode_line#* }
+              if [ -x "$f" ]; then have_mode=100755; else have_mode=100644; fi
+              if [ "$have_mode" != "$want_mode" ]; then
+                echo "::error::A regenerated file's executable bit changed AFTER the regenerate step fingerprinted it ($f: expected $want_mode, now $have_mode) — something in the review run rewrote it. Not opening a PR."
+                exit 1
+              fi
+            done <<< "$REGEN_MODE"
           fi
           # The artifact names review.md unconditionally; a run with no
           # review checks configured still ships an empty one.
@@ -964,6 +1008,7 @@ jobs:
           CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
           REGENERATED_FILES: ${{ inputs.regenerated-files }}
           REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
+          REGEN_MODE: ${{ needs.update.outputs.regen_mode }}
           # The diffstat below names consumer paths — data, not patterns.
           GIT_LITERAL_PATHSPECS: '1'
         run: |
@@ -1021,6 +1066,24 @@ jobs:
             rm -rf -- "$RUNNER_TEMP/regenerated"
             printf '%s\n' "$REGEN_SHA" | sha256sum -c --strict --quiet \
               || { echo '::error::A regenerated file does not match what the update job fingerprinted.'; exit 1; }
+            # Same reasoning as the update job's own re-check: content can
+            # match while the executable bit doesn't — a chmod between
+            # fingerprinting and here, or a plugin that runs `tar` with its
+            # own idea of default modes — and `git add` below would commit
+            # whatever bit the restored file happens to carry.
+            while IFS= read -r mode_line; do
+              [ -z "$mode_line" ] && continue
+              # Split only the fixed "MODE " prefix — see the update job's
+              # own re-check for why `read`'s whitespace-trimming is unsafe
+              # here.
+              want_mode=${mode_line%% *}
+              f=${mode_line#* }
+              if [ -x "$f" ]; then have_mode=100755; else have_mode=100644; fi
+              if [ "$have_mode" != "$want_mode" ]; then
+                echo "::error::A regenerated file's executable bit does not match what the update job fingerprinted ($f: expected $want_mode, got $have_mode)."
+                exit 1
+              fi
+            done <<< "$REGEN_MODE"
             # The body's Regenerated section, taken NOW while the tree
             # still diffs against the base — after the commit below there
             # is nothing left to diff, and the adopted-branch path never
@@ -1101,6 +1164,7 @@ jobs:
           CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
           REGENERATED_FILES: ${{ inputs.regenerated-files }}
           REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
+          REGEN_MODE: ${{ needs.update.outputs.regen_mode }}
         run: |
           set -euo pipefail
           # Keyed on the RUN's date: the job runs weekly, so a month-scoped
@@ -1192,6 +1256,28 @@ jobs:
                 done <<< "$REGEN_SHA"
                 if [ -z "$want" ] \
                    || [ "$(git show "FETCH_HEAD:$p" 2>/dev/null | sha256sum | cut -d' ' -f1)" != "$want" ]; then
+                  paths_ok=false
+                  break
+                fi
+                # Content can match while the mode doesn't: `git ls-tree`
+                # reports the mode FETCH_HEAD actually committed for this
+                # path (100644 / 100755 for a regular file), which is the
+                # same two-state distinction the fingerprint records — an
+                # adopted branch whose executable bit drifted from what
+                # this run verified must not be waved through on content
+                # alone.
+                want_mode=''
+                while IFS= read -r mode_line; do
+                  [ -z "$mode_line" ] && continue
+                  # Split only the fixed "MODE " prefix — `read` would trim
+                  # a path's leading/trailing spaces and could match the
+                  # wrong declared file.
+                  mode_line_mode=${mode_line%% *}
+                  mode_line_path=${mode_line#* }
+                  if [ "$mode_line_path" = "$p" ]; then want_mode=$mode_line_mode; fi
+                done <<< "$REGEN_MODE"
+                have_mode=$(git ls-tree FETCH_HEAD -- "$p" | cut -d' ' -f1)
+                if [ -z "$want_mode" ] || [ "$have_mode" != "$want_mode" ]; then
                   paths_ok=false
                   break
                 fi
