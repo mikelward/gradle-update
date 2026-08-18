@@ -57,13 +57,34 @@ on:
       review-checks:
         description: >-
           Commands that flag the batch for HUMAN review, one per line — the
-          consumer's license-drift check is the motivating case. They run
-          after the checks, in the same untrusted window; any nonzero exit
-          marks the PR "needs human review" (title and body) and leaves
-          auto-merge unarmed, without failing the batch. Tracked files a
-          review check modifies (a regenerated license list, say) are
-          diffed into the report and restored — review checks observe,
-          they never publish. Empty disables.
+          consumer's license-diff check is the motivating case. They run
+          after the checks and the regenerate commands, in the same
+          untrusted window; any nonzero exit marks the PR "needs human
+          review" (title and body) and leaves auto-merge unarmed, without
+          failing the batch, and what the command printed is captured into
+          the body's Review section as the reason. Tracked files a review
+          check modifies are diffed into the report and restored — review
+          checks observe, they never publish; a file the batch should
+          publish belongs in regenerated-files instead. Empty disables.
+        type: string
+        default: ''
+      regenerate:
+        description: >-
+          Commands that rebuild files derived from the dependency set (a
+          bundled-license inventory, say), one per line. They run after the
+          checks, in the same untrusted window; a failure stops the run,
+          because publishing a batch whose derived files are stale is the
+          silent drift this input exists to end. Empty disables.
+        type: string
+        default: ''
+      regenerated-files:
+        description: >-
+          Tracked files the regenerate commands rebuild, one per line —
+          committed with the catalog when they change, fingerprinted and
+          verified the same way. The declaration is the boundary: only
+          files named here may change during regeneration, and anything
+          else the commands touch stops the run exactly as the tree check
+          always has. Required when regenerate is set.
         type: string
         default: ''
       commit-prefix:
@@ -103,6 +124,7 @@ jobs:
       changed: ${{ steps.changed.outputs.changed }}
       passed: ${{ steps.checks.outputs.passed }}
       review_flagged: ${{ steps.review.outputs.flagged }}
+      regen_sha: ${{ steps.regen.outputs.files_sha }}
       base: ${{ steps.base.outputs.sha }}
       catalog_sha: ${{ steps.changed.outputs.catalog_sha }}
       engine_sha: ${{ steps.engine.outputs.sha }}
@@ -307,6 +329,86 @@ jobs:
           : > "$GITHUB_PATH"
           : > "$GITHUB_ENV"
 
+      # Derived files are the batch's own product: a bundled-license
+      # inventory rebuilt from the new dependency set belongs IN the batch,
+      # not restored out of it — a consumer whose CI fails on inventory
+      # drift would otherwise need a human regeneration push after every
+      # benign bump. The declared list is the boundary: these commands run
+      # unreviewed dependency and plugin code, so only files named in
+      # regenerated-files may change here; anything else still stops the
+      # run at the tree check. Each declared file is fingerprinted as a
+      # step output the moment the commands finish — like the catalog, so
+      # the review checks that run next, and anything else in this
+      # untrusted window, can no longer alter what the publish job vouches
+      # for.
+      - name: Regenerate derived files
+        if: steps.changed.outputs.changed == 'true' && inputs.regenerate != ''
+        id: regen
+        env:
+          REGENERATE: ${{ inputs.regenerate }}
+          REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          CATALOG: ${{ inputs.catalog }}
+          GIT_LITERAL_PATHSPECS: '1'
+        run: |
+          set -euo pipefail
+          # The declaration is load-bearing — it is the commit allowlist —
+          # so an empty one is a configuration error, not a default.
+          files=()
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            files+=("$f")
+          done <<< "$REGENERATED_FILES"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo '::error::regenerate is set but regenerated-files is empty — declare the files the commands rebuild.'
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            # Scratch names would let a regeneration overwrite the run's
+            # own reports and publish command-controlled content under the
+            # workflow's name; the catalog is the engine's alone.
+            case "$f" in
+              report.md|checks.md|deps-stat.txt|review.md|body.md|regen-stat.txt|handoff-catalog.toml|handoff-regenerated.tar)
+                echo "::error::regenerated-files must not name the run's own scratch file: $f"
+                exit 1 ;;
+            esac
+            if [ "$f" = "$CATALOG" ]; then
+              echo '::error::regenerated-files must not name the catalog — the engine owns it.'
+              exit 1
+            fi
+            # Tracked files only: the publish job restores each one over a
+            # checkout of the base, so a path with no base state has
+            # nothing to be a regeneration OF — commit it by hand first.
+            git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || {
+              echo "::error::regenerated-files names a file git does not track: $f"
+              exit 1
+            }
+          done
+          # Same containment as the checks. A failure is a STOP, not a
+          # flag: a batch whose derived files could not be rebuilt would
+          # publish stale ones, which is the silent drift this step
+          # exists to end.
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::$cmd"
+            ( export GITHUB_OUTPUT=/dev/null GITHUB_ENV=/dev/null \
+                GITHUB_PATH=/dev/null GITHUB_STEP_SUMMARY=/dev/null \
+                GITHUB_STATE=/dev/null
+              eval "$cmd" )
+            echo '::endgroup::'
+          done <<< "$REGENERATE"
+          # sha256sum's own "hash  path" lines, so the publish job can
+          # verify the whole set with one `sha256sum -c`.
+          {
+            echo 'files_sha<<REGEN_SHA_EOF'
+            sha256sum -- "${files[@]}"
+            echo 'REGEN_SHA_EOF'
+          } >> "$GITHUB_OUTPUT"
+          git diff --stat -- "${files[@]}" >> "$GITHUB_STEP_SUMMARY"
+          # Plugin code ran above; discard anything it queued for later
+          # steps, same as every step in this window.
+          : > "$GITHUB_PATH"
+          : > "$GITHUB_ENV"
+
       # Review checks decide whether a HUMAN looks before the batch lands —
       # a nonzero exit flags the PR and holds auto-merge back, it does not
       # fail the batch. They run in the same untrusted window and under the
@@ -327,6 +429,12 @@ jobs:
         env:
           REVIEW_CHECKS: ${{ inputs.review-checks }}
           CATALOG: ${{ inputs.catalog }}
+          REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          # Empty unless the regenerate step actually ran and fingerprinted
+          # the declared files — the exemptions below key off THAT, so a
+          # declared-but-not-regenerated file is still treated as any other
+          # tree change.
+          REGEN_SHA: ${{ steps.regen.outputs.files_sha }}
           GIT_LITERAL_PATHSPECS: '1'
         run: |
           set -euo pipefail
@@ -344,10 +452,23 @@ jobs:
           # rename never emits the two-field porcelain record this parsing
           # does not read.) The run's own scratch files are the allowlist,
           # as below.
+          # Regenerated files join the exemptions the way the catalog
+          # does: legitimately changed before this step, never restored by
+          # it, and guarded by their own fingerprints below — a review
+          # check that touches one fails that check, as anything else
+          # would. Keyed off REGEN_SHA, so the exemption exists only when
+          # the regenerate step actually ran and fingerprinted them.
+          exempt=(-e "$CATALOG" -e checks.md -e deps-stat.txt -e report.md)
+          if [ -n "$REGEN_SHA" ]; then
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              exempt+=(-e "$f")
+            done <<< "$REGENERATED_FILES"
+          fi
           treestate() {
             git status --porcelain -z --untracked-files=all --no-renames \
               | tr '\0' '\n' | sed '/^$/d' | sed 's/^...//' \
-              | grep -Fxv -e "$CATALOG" -e checks.md -e deps-stat.txt -e report.md || true
+              | grep -Fxv "${exempt[@]}" || true
           }
           # review.md is NOT exempt at this gate: this step writes its
           # report outside the workspace until the loop is done, so a
@@ -523,10 +644,15 @@ jobs:
             [ -z "$cmd" ] && continue
             echo "::group::$cmd"
             rc=0
+            # Captured to a file OUTSIDE the workspace so a flagging
+            # command's own words can go into the report below; the log
+            # still gets every byte, and a command that cleans the
+            # workspace cannot delete this.
             ( export GITHUB_OUTPUT=/dev/null GITHUB_ENV=/dev/null \
                 GITHUB_PATH=/dev/null GITHUB_STEP_SUMMARY=/dev/null \
                 GITHUB_STATE=/dev/null
-              eval "$cmd" ) || rc=$?
+              eval "$cmd" ) > "$RUNNER_TEMP/review-out" 2>&1 || rc=$?
+            cat -- "$RUNNER_TEMP/review-out"
             echo '::endgroup::'
             # The verdict line carries the command text too, so it is
             # charged the same way; a line past the cap folds into the
@@ -545,9 +671,40 @@ jobs:
             else
               omittedcmds=$((omittedcmds + 1))
             fi
+            # A flagging command's own output is the REASON a human is
+            # being asked to look — a license check names the exact entry
+            # that changed — so it goes into the report, charged against
+            # the same budget as the diffs and under the same per-item
+            # cap. The step log above already carries it in full. Green
+            # commands stay quiet: their output is progress noise, and
+            # the ✅ line says everything the body needs.
+            if [ "$rc" -ne 0 ] && [ -s "$RUNNER_TEMP/review-out" ]; then
+              heading=$'\n'"What \`$cmd\` reported:"$'\n\n''```'
+              size=$(wc -c < "$RUNNER_TEMP/review-out")
+              take=$(( size < 20000 ? size : 20000 ))
+              if [ "$take" -gt "$budget" ]; then take=$budget; fi
+              charge=$(( $(printf '%s\n' "$heading" | wc -c) + take + 4 ))
+              if [ "$take" -gt 0 ] && [ "$budget" -ge "$charge" ]; then
+                budget=$((budget - charge))
+                printf '%s\n' "$heading" >> "$REVIEW_TMP"
+                head -c "$take" -- "$RUNNER_TEMP/review-out" >> "$REVIEW_TMP"
+                printf '\n```\n' >> "$REVIEW_TMP"
+                if [ "$take" -lt "$size" ]; then
+                  note="… output truncated at $take of $size bytes — the step log has it in full."
+                  budget=$((budget - $(printf '%s\n' "$note" | wc -c)))
+                  if [ "$budget" -ge 0 ]; then
+                    printf '%s\n' "$note" >> "$REVIEW_TMP"
+                  else
+                    omitted=$((omitted + 1))
+                  fi
+                fi
+              else
+                omitted=$((omitted + 1))
+              fi
+            fi
             capture_and_restore "$cmd"
           done <<< "$REVIEW_CHECKS"
-          rm -f -- "$RUNNER_TEMP/review-diff"
+          rm -f -- "$RUNNER_TEMP/review-diff" "$RUNNER_TEMP/review-out"
           if [ "$omitted" -gt 0 ] || [ "$omittedcmds" -gt 0 ]; then
             {
               echo
@@ -592,6 +749,11 @@ jobs:
           CATALOG: ${{ inputs.catalog }}
           CATALOG_SHA: ${{ steps.changed.outputs.catalog_sha }}
           REVIEW_CHECKS: ${{ inputs.review-checks }}
+          REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          # Empty unless the regenerate step ran and fingerprinted the
+          # declared files — every regenerated-file exemption below keys
+          # off that, never off the declaration alone.
+          REGEN_SHA: ${{ steps.regen.outputs.files_sha }}
         run: |
           set -euo pipefail
           # `git status`, not `git diff`: diff only sees tracked changes, so
@@ -605,6 +767,17 @@ jobs:
           # non-ASCII would otherwise never equal the literal $CATALOG and
           # fail every publication under such a path.
           allow=(-e "$CATALOG" -e checks.md -e deps-stat.txt -e report.md)
+          # Regenerated files are the batch's own product when the
+          # regenerate step ran — expected to differ, vouched for by the
+          # fingerprint check below rather than by this allowlist.
+          derived=()
+          if [ -n "$REGEN_SHA" ]; then
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              derived+=("$f")
+              allow+=(-e "$f")
+            done <<< "$REGENERATED_FILES"
+          fi
           # review.md is workflow-owned only when review checks ran (that
           # step creates it, after refusing a preexisting one). With review
           # checks disabled nothing here writes it, so one appearing now is
@@ -653,9 +826,28 @@ jobs:
             echo '::error::The catalog changed AFTER the engine resolved it — something in the check run rewrote it. Not opening a PR.'
             exit 1
           fi
+          # Nor the regenerated files since their step fingerprinted them —
+          # this is what lets the review step leave them unrestored: any
+          # later hand on one of them stops the run here.
+          if [ -n "$REGEN_SHA" ]; then
+            printf '%s\n' "$REGEN_SHA" | sha256sum -c --strict --quiet \
+              || { echo '::error::A regenerated file changed AFTER the regenerate step fingerprinted it — something in the review run rewrote it. Not opening a PR.'; exit 1; }
+          fi
           # The artifact names review.md unconditionally; a run with no
           # review checks configured still ships an empty one.
           [ -f review.md ] || : > review.md
+          # The regenerated files travel as ONE tar under a fixed literal
+          # name, for the same reason the catalog travels as
+          # handoff-catalog.toml: upload-artifact reads its path list as
+          # glob patterns, and consumer paths are data. NUL-delimited
+          # verbatim names so no filename shape can smuggle options or
+          # split into two. Always created — empty when the feature is
+          # off — so the artifact's fixed path list never goes missing.
+          if [ "${#derived[@]}" -gt 0 ]; then
+            printf '%s\0' "${derived[@]}" | tar -cf handoff-regenerated.tar --null --verbatim-files-from -T -
+          else
+            tar -cf handoff-regenerated.tar -T /dev/null
+          fi
           # Stage the catalog for the artifact under a fixed literal name:
           # upload-artifact reads its path list as GLOB PATTERNS, so a
           # metacharacter in a custom catalog path ([, ?) could silently
@@ -675,6 +867,7 @@ jobs:
           name: dependency-update
           path: |
             handoff-catalog.toml
+            handoff-regenerated.tar
             checks.md
             review.md
             deps-stat.txt
@@ -733,9 +926,48 @@ jobs:
           # would otherwise become code under this job's write token. As env
           # it is data, and a forged value is bounded to a failed comparison.
           CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
+          REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
+          # The diffstat below names consumer paths — data, not patterns.
+          GIT_LITERAL_PATHSPECS: '1'
         run: |
           set -euo pipefail
           mv -- .dependency-update/checks.md .dependency-update/review.md .dependency-update/deps-stat.txt .dependency-update/report.md .
+          # The regenerated files, before the catalog so the catalog still
+          # moves last. The tar was written on the machine that ran
+          # dependency code, so nothing in it is trusted by name: it is
+          # unpacked OUTSIDE the workspace, only the files the consumer's
+          # own configuration declares are copied out of it — each one a
+          # tracked path, restored over the base checkout — anything extra
+          # in it is a stop, and the copies must then match the
+          # fingerprints taken before any review code ran.
+          : > regen-stat.txt
+          if [ -n "$REGEN_SHA" ]; then
+            mkdir -- "$RUNNER_TEMP/regenerated"
+            tar -xf .dependency-update/handoff-regenerated.tar -C "$RUNNER_TEMP/regenerated"
+            derived=()
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              derived+=("$f")
+              [ -f "$RUNNER_TEMP/regenerated/$f" ] \
+                || { echo "::error::The artifact is missing declared regenerated file: $f"; exit 1; }
+              cp -- "$RUNNER_TEMP/regenerated/$f" "$f"
+              rm -- "$RUNNER_TEMP/regenerated/$f"
+            done <<< "$REGENERATED_FILES"
+            leftover=$(find "$RUNNER_TEMP/regenerated" -type f -o -type l | head -n 1)
+            if [ -n "$leftover" ]; then
+              echo "::error::The regenerated-files artifact carried an undeclared file: $leftover"
+              exit 1
+            fi
+            rm -rf -- "$RUNNER_TEMP/regenerated"
+            printf '%s\n' "$REGEN_SHA" | sha256sum -c --strict --quiet \
+              || { echo '::error::A regenerated file does not match what the update job fingerprinted.'; exit 1; }
+            # The body's Regenerated section, taken NOW while the tree
+            # still diffs against the base — after the commit below there
+            # is nothing left to diff, and the adopted-branch path never
+            # commits at all.
+            git diff --stat -- "${derived[@]}" > regen-stat.txt
+          fi
           cp -- .dependency-update/handoff-catalog.toml "$CATALOG"
           rm -rf -- .dependency-update
           [ "$(sha256sum -- "$CATALOG" | cut -d' ' -f1)" = "$CATALOG_SHA" ] \
@@ -808,6 +1040,8 @@ jobs:
           PASSED: ${{ needs.update.outputs.passed }}
           REVIEW_FLAGGED: ${{ needs.update.outputs.review_flagged }}
           CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
+          REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
         run: |
           set -euo pipefail
           # Keyed on the RUN's date: the job runs weekly, so a month-scoped
@@ -867,7 +1101,33 @@ jobs:
             # subject instead. (`-z` so a path git would quote still
             # compares literally.)
             diff_paths=$(git diff -z --name-only HEAD FETCH_HEAD | tr '\0' '\n' | sed '/^$/d')
-            if [ "$diff_paths" = "$CATALOG" ] \
+            # The catalog must be in the diff, and everything else in it
+            # must be a declared regenerated file whose FETCH_HEAD content
+            # matches the fingerprint this run verified — the same bytes
+            # vouched for above, just already on the branch. Any other
+            # path, or a stale regeneration from an older attempt, refuses
+            # adoption and takes a fresh branch.
+            paths_ok=true
+            printf '%s\n' "$diff_paths" | grep -Fxq -- "$CATALOG" || paths_ok=false
+            while IFS= read -r p; do
+              [ -z "$p" ] && continue
+              [ "$p" = "$CATALOG" ] && continue
+              if [ -z "$REGEN_SHA" ] || ! printf '%s\n' "$REGENERATED_FILES" | grep -Fxq -- "$p"; then
+                paths_ok=false
+                break
+              fi
+              want=''
+              while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                if [ "${line#*  }" = "$p" ]; then want=${line%%  *}; fi
+              done <<< "$REGEN_SHA"
+              if [ -z "$want" ] \
+                 || [ "$(git show "FETCH_HEAD:$p" 2>/dev/null | sha256sum | cut -d' ' -f1)" != "$want" ]; then
+                paths_ok=false
+                break
+              fi
+            done <<< "$diff_paths"
+            if [ "$paths_ok" = true ] \
                && [ "$(git rev-list --count HEAD..FETCH_HEAD)" = "1" ] \
                && [ "$(git log -1 --format=%B FETCH_HEAD)" = "$title" ] \
                && [ "$(git show "FETCH_HEAD:$CATALOG" 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$CATALOG_SHA" ]; then
@@ -920,8 +1180,16 @@ jobs:
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git switch -c "$branch"
             # Stage by name: the artifact only carries these files, but naming
-            # the catalog keeps that true even if it ever carries more.
+            # them keeps that true even if it ever carries more. Staging an
+            # unchanged regenerated file is a no-op, so the batch commits
+            # only what actually moved.
             git add -- "$CATALOG"
+            if [ -n "$REGEN_SHA" ]; then
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                git add -- "$f"
+              done <<< "$REGENERATED_FILES"
+            fi
             git commit -q -m "$title"
             git push "$remote" "HEAD:refs/heads/$branch"
             validated_head=$(git rev-parse HEAD)
@@ -1020,6 +1288,16 @@ jobs:
             cat deps-stat.txt
             echo '```'
             echo
+            if [ -s regen-stat.txt ]; then
+              echo '## Regenerated'
+              echo
+              echo 'Derived from the new dependency set and committed with it:'
+              echo
+              echo '```'
+              cat regen-stat.txt
+              echo '```'
+              echo
+            fi
             echo '---'
             echo '_Opened by the weekly gradle-update workflow._'
           } > body.md
