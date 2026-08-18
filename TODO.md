@@ -72,3 +72,13 @@ costing maintenance:
   `settings.gradle.kts`, compiler versions read from build files) are
   reported as unmanaged, never updated. Managing them means parsing
   Kotlin script, which is out of scope on purpose.
+
+## Review and merge gates
+
+- [ ] Add `codex-review-check.yml` (mikelward/codex-review's consumer
+      check): Codex reviews run here, but nothing verifies the workflow
+      pin the ruleset should require.
+- [ ] Verify the settings half of the fleet's bar: a ruleset on the
+      default branch requiring the CI gate, the `codex` status,
+      conversation resolution and up-to-date branches, and the auto-merge
+      setting enabled.
