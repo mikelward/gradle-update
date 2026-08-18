@@ -363,6 +363,19 @@ jobs:
             exit 1
           fi
           for f in "${files[@]}"; do
+            # Canonicalized the same way the catalog is: every later
+            # comparison against this path — the tree check's allowlist,
+            # the fingerprint lookups, the adoption diff — is a plain string
+            # match, so a noncanonical spelling like `./licenses.txt` would
+            # be declared and fingerprinted here but never match the
+            # canonical path `git status` reports later, aborting every
+            # batch that actually changes the file. Rewritten in place so
+            # every reference from here on uses the one true spelling.
+            canon=$(realpath -m --relative-to="$PWD" -- "$f")
+            if [ "$canon" != "$f" ]; then
+              echo "::error::regenerated-files entry '$f' is not in canonical repo-relative form; use '$canon'."
+              exit 1
+            fi
             # Scratch names would let a regeneration overwrite the run's
             # own reports and publish command-controlled content under the
             # workflow's name; the catalog is the engine's alone.
@@ -393,6 +406,15 @@ jobs:
               exit 1
             }
           done
+          # Fingerprinted before the regenerate commands run, verified after:
+          # report.md and deps-stat.txt already exist by now (written by
+          # earlier steps) and checks.md is complete, but nothing before this
+          # point stops a `regenerate` command — arbitrary Gradle, same as
+          # the checks — from writing to them too. Without this, that edit
+          # would ride straight through: the tree check later allowlists
+          # these three names unconditionally, so a regeneration-authored
+          # report would publish as the workflow's own.
+          reports_sha_before=$(sha256sum report.md checks.md deps-stat.txt)
           # Same containment as the checks. A failure is a STOP, not a
           # flag: a batch whose derived files could not be rebuilt would
           # publish stale ones, which is the silent drift this step
@@ -406,6 +428,10 @@ jobs:
               eval "$cmd" )
             echo '::endgroup::'
           done <<< "$REGENERATE"
+          if [ "$(sha256sum report.md checks.md deps-stat.txt)" != "$reports_sha_before" ]; then
+            echo '::error::a regenerate command modified report.md, checks.md, or deps-stat.txt — fix the regenerate input; these files belong to the workflow, not to a regeneration command.'
+            exit 1
+          fi
           # sha256sum's own "hash  path" lines, so the publish job can
           # verify the whole set with one `sha256sum -c`.
           {
