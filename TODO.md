@@ -101,3 +101,10 @@ costing maintenance:
       default branch requiring the CI gate, the `codex` status,
       conversation resolution and up-to-date branches, and the auto-merge
       setting enabled.
+- [ ] `update-versions.mjs` / `update-versions.test.js` still carry the
+      pre-rename generic name — `check-gradle-update.mjs` and its test file
+      already moved to the repo's `check-<name>-update.mjs` scheme (#12),
+      and the scratch checkout directory followed (`.jvm-update` →
+      `.gradle-update`), but the resolver script didn't. Decide whether it
+      becomes `update-gradle.mjs` (or similar) for consistency, or is
+      deliberately exempt because it's the engine rather than a checker.
