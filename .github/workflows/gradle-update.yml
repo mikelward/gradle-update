@@ -1471,15 +1471,32 @@ jobs:
             validated_head=$(git rev-parse HEAD)
           fi
 
-          # branch/title/verdict/validated_head are plain single-line text —
-          # the fixed set this workflow itself ever produces, none of it
-          # carrying a newline — so the simple `key=value` form is safe;
-          # nothing here needs a heredoc.
+          # title embeds $COMMIT_PREFIX, a consumer input — a `key=value`
+          # write for it is not safe. A prefix holding an embedded newline
+          # followed by a line that reads like another output ("branch=…")
+          # is interpreted as exactly that: it overwrites the branch this
+          # run actually resolved, and the next step queries, disarms,
+          # edits, and dispatches CI for whatever branch that line named
+          # instead — reproduced this precisely (a crafted commit-prefix
+          # silently replaced $GITHUB_OUTPUT's branch value). The heredoc
+          # form treats everything between the two delimiter lines as one
+          # literal value regardless of what it contains; the delimiter
+          # itself is randomized per run so nothing in a consumer's input
+          # can be crafted in advance to match it and break out early.
+          delim="EOF_${GITHUB_RUN_ID}_${RANDOM}${RANDOM}"
           {
-            echo "branch=$branch"
-            echo "title=$title"
-            echo "verdict=$verdict"
-            echo "validated_head=$validated_head"
+            echo "branch<<$delim"
+            printf '%s\n' "$branch"
+            echo "$delim"
+            echo "title<<$delim"
+            printf '%s\n' "$title"
+            echo "$delim"
+            echo "verdict<<$delim"
+            printf '%s\n' "$verdict"
+            echo "$delim"
+            echo "validated_head<<$delim"
+            printf '%s\n' "$validated_head"
+            echo "$delim"
           } >> "$GITHUB_OUTPUT"
 
       - name: Open the pull request
