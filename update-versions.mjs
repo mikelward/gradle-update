@@ -9,7 +9,7 @@
 // division of labor: this script runs in the update job and only ever reads
 // Maven METADATA over HTTPS — no dependency code executes while it decides
 // anything. The consumer's Gradle checks (which do execute dependency and
-// plugin code) run afterwards, and check-versions-update.mjs re-validates the
+// plugin code) run afterwards, and check-gradle-update.mjs re-validates the
 // diff from a clean context in the publish job.
 //
 // What "no majors" covers, honestly: the catalog's own entries. Gradle has no
