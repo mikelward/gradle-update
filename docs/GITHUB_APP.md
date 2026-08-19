@@ -1,5 +1,10 @@
 # Running the weekly batch as a GitHub App, not the default token
 
+**Not the currently used path.** `docs/PAT.md` covers the same problem with
+a simpler one-time setup while every consumer is single-owner; see this
+repository's `TODO.md` for why this App path is the one to come back to
+once a repository takes external contributions.
+
 ## The problem this solves
 
 The publish job pushes the update branch and opens the pull request with

@@ -104,12 +104,15 @@ repository collaborator; dispatch sidesteps the gate. It must carry
 `workflow_dispatch` with a `pr` input on the consumer's default branch; set
 it empty to disable.
 
-Two optional secrets, `app-id` and `app-private-key`, let a consumer supply
-a GitHub App installation instead of GITHUB_TOKEN — an App installation IS a
-collaborator, so the pull requests it opens never hit the approval gate in
-the first place, and `ci-workflow` becomes unnecessary. See
-[`docs/GITHUB_APP.md`](docs/GITHUB_APP.md) for the one-time setup. Providing
-one secret without the other is refused: a partial credential mints no
+An optional `token` secret lets a consumer supply a personal access token
+instead of GITHUB_TOKEN — a real user account IS a collaborator, so the pull
+requests it opens never hit the approval gate in the first place, and
+`ci-workflow` becomes unnecessary. See [`docs/PAT.md`](docs/PAT.md) for the
+one-time setup — the currently used path (see `TODO.md`). Two further
+optional secrets, `app-id` and `app-private-key`, do the same via a GitHub
+App installation instead; see [`docs/GITHUB_APP.md`](docs/GITHUB_APP.md).
+`token` takes priority if both are set. Providing `app-id` without
+`app-private-key`, or vice versa, is refused: a partial credential mints no
 token.
 
 **Unattended landing needs the ruleset to require branches up to date**

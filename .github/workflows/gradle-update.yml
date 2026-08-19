@@ -103,8 +103,9 @@ on:
           that run pending manual approval, since GITHUB_TOKEN's identity
           (`github-actions[bot]`) is not a repository collaborator; nothing
           runs until someone clicks approve. Dispatch sidesteps the gate
-          (see docs/GITHUB_APP.md for the version-controlled fix: a GitHub
-          App installation, which IS a collaborator). It must carry
+          (see docs/PAT.md or docs/GITHUB_APP.md for the version-controlled
+          fix: a real user or a GitHub App installation, either of which IS
+          a collaborator). It must carry
           `workflow_dispatch` on the default branch. Empty disables the
           dispatch.
         type: string
@@ -122,6 +123,18 @@ on:
         required: false
       app-private-key:
         description: The App's private key (the full .pem contents), paired with app-id.
+        required: false
+      token:
+        description: >-
+          A personal access token to push the branch and open the pull
+          request with instead of GITHUB_TOKEN — see docs/PAT.md. Simpler
+          one-time setup than app-id/app-private-key, at the cost of tying
+          the weekly PR to a real user account rather than a scoped,
+          independently-revocable App installation; see docs/PAT.md's note
+          on reconsidering this once a repository takes external
+          contributions. Optional; omit to keep using GITHUB_TOKEN (or
+          app-id/app-private-key, if those are supplied instead). Takes
+          priority over app-id/app-private-key if both are set.
         required: false
 
 # Explicitly empty, not omitted: the CALLER grants the real permissions
@@ -1066,13 +1079,17 @@ jobs:
     env:
       APP_ID: ${{ secrets.app-id }}
       APP_PRIVATE_KEY: ${{ secrets.app-private-key }}
+      PAT: ${{ secrets.token }}
     steps:
       # A partial credential mints no token either way; refuse it explicitly
       # rather than silently falling back to GITHUB_TOKEN, which would read
       # as "the App is wired up" while actually still hitting the approval
-      # gate docs/GITHUB_APP.md describes.
+      # gate docs/GITHUB_APP.md describes. Skipped once a token is set: the
+      # App path is irrelevant then (PAT takes priority — see the GH_TOKEN
+      # resolution below), so a leftover half-removed app-id from a PAT
+      # migration must not fail a run it can no longer affect.
       - name: Refuse a half-supplied App credential
-        if: (env.APP_ID == '') != (env.APP_PRIVATE_KEY == '')
+        if: env.PAT == '' && (env.APP_ID == '') != (env.APP_PRIVATE_KEY == '')
         run: |
           echo "::error::app-id and app-private-key must both be set, or both left empty — one without the other mints no token."
           exit 1
@@ -1084,10 +1101,12 @@ jobs:
       # consumer's own on: pull_request workflows — including this job's
       # own dispatch fallback below, which the App token's identity being a
       # real collaborator makes unnecessary. Not pinned by SHA yet — see
-      # TODO.md.
+      # TODO.md. Skipped when a token is set: PAT takes priority, so minting
+      # an App installation token that GH_TOKEN resolution would then
+      # discard unused is a needless credential mint.
       - name: Mint a GitHub App installation token
         id: app-token
-        if: env.APP_ID != ''
+        if: env.PAT == '' && env.APP_ID != ''
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ env.APP_ID }}
@@ -1257,7 +1276,7 @@ jobs:
 
       - name: Stop if the default branch moved while the checks ran
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ env.PAT || steps.app-token.outputs.token || github.token }}
           # Data, not script text — an apostrophe is legal in a git ref name.
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           # Env, not inline — see the fingerprint step.
@@ -1288,7 +1307,7 @@ jobs:
       - name: Resolve the branch, then adopt or commit and push
         id: resolve
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ env.PAT || steps.app-token.outputs.token || github.token }}
           # Always GITHUB_TOKEN, never the App token: the Actions API read
           # below needs Actions:Read, which docs/GITHUB_APP.md deliberately
           # does not ask the App to have (Contents + pull requests only).
@@ -1581,15 +1600,16 @@ jobs:
 
       - name: Open the pull request
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ env.PAT || steps.app-token.outputs.token || github.token }}
           CI_WORKFLOW: ${{ inputs.ci-workflow }}
-          # Whether THIS run minted an App token — not whether the pull
-          # request it ends up using was actually opened with one. An
-          # adopted rerun can reuse a PR an earlier, non-App attempt opened;
-          # the script below derives the real app_opened_pr from this plus
-          # whether the resolve step pushed or this step creates the PR
-          # itself.
-          APP_TOKEN_USED: ${{ steps.app-token.outputs.token != '' }}
+          # Whether THIS run authored with a real collaborator's identity —
+          # a PAT or a minted App token — rather than GITHUB_TOKEN. Not
+          # whether the pull request it ends up using was actually opened
+          # with one. An adopted rerun can reuse a PR an earlier, default-
+          # token attempt opened; the script below derives the real
+          # nondefault_opened_pr from this plus whether the resolve step
+          # pushed or this step creates the PR itself.
+          NONDEFAULT_TOKEN_USED: ${{ env.PAT != '' || steps.app-token.outputs.token != '' }}
           # Always GITHUB_TOKEN, never the App token — see the resolve
           # step's DEFAULT_TOKEN comment. Used here for the Actions-API
           # dispatch and the branch-rules probe, neither of which the App's
@@ -1616,7 +1636,7 @@ jobs:
           # but GitHub gates that run pending manual approval, since
           # GITHUB_TOKEN's identity (github-actions[bot]) is not a
           # repository collaborator, and nothing runs until someone clicks
-          # approve (docs/GITHUB_APP.md). Dispatch sidesteps the gate: ask
+          # approve (docs/PAT.md, docs/GITHUB_APP.md). Dispatch sidesteps the gate: ask
           # for one explicitly against the branch just pushed, naming the PR
           # so the consumer's docs lane can bind the run to it. Only a PR
           # still based on the default branch may be reused: the adoption
@@ -1636,21 +1656,22 @@ jobs:
             pr_opened_here=true
           fi
 
-          # APP_TOKEN_USED says only that THIS invocation minted an App
-          # token — not that the pull request open above actually used it.
-          # An adopted rerun (adopt=true) reuses whatever PR an EARLIER
-          # attempt already opened, possibly under GITHUB_TOKEN if App
-          # credentials were added between attempts, with no push and no
-          # `gh pr create` of its own to carry the App's identity. Only
-          # trust the native trigger when this run itself did one of the
-          # two things that puts the App's identity on the wire: pushed the
-          # branch fresh (adopt != true, in the resolve step) or created the
-          # pull request here (pr_opened_here). Otherwise fall back to
-          # dispatching same as the no-App case — a possibly-redundant CI
-          # run is far cheaper than one that silently never starts.
-          app_opened_pr=false
-          if [ "$APP_TOKEN_USED" = 'true' ] && { [ "$adopt" != true ] || [ "$pr_opened_here" = true ]; }; then
-            app_opened_pr=true
+          # NONDEFAULT_TOKEN_USED says only that THIS invocation had a PAT
+          # or minted App token available — not that the pull request open
+          # above actually used it. An adopted rerun (adopt=true) reuses
+          # whatever PR an EARLIER attempt already opened, possibly under
+          # GITHUB_TOKEN if the credential was added between attempts, with
+          # no push and no `gh pr create` of its own to carry the real
+          # identity. Only trust the native trigger when this run itself did
+          # one of the two things that puts that identity on the wire:
+          # pushed the branch fresh (adopt != true, in the resolve step) or
+          # created the pull request here (pr_opened_here). Otherwise fall
+          # back to dispatching same as the GITHUB_TOKEN case — a possibly-
+          # redundant CI run is far cheaper than one that silently never
+          # starts.
+          nondefault_opened_pr=false
+          if [ "$NONDEFAULT_TOKEN_USED" = 'true' ] && { [ "$adopt" != true ] || [ "$pr_opened_here" = true ]; }; then
+            nondefault_opened_pr=true
           fi
 
           # Clear any stale auto-merge from a prior attempt NOW, before the
@@ -1675,14 +1696,15 @@ jobs:
           fi
 
           ci_started=false
-          if [ "$app_opened_pr" != 'true' ] && [ -n "$CI_WORKFLOW" ]; then
+          if [ "$nondefault_opened_pr" != 'true' ] && [ -n "$CI_WORKFLOW" ]; then
             # GH_TOKEN overridden to $DEFAULT_TOKEN here too, same as the
             # actions/runs read in the resolve step: this branch runs
-            # whenever an App token was minted but didn't open the PR (an
-            # adopted rerun of a non-App PR), so the ambient $GH_TOKEN can
-            # still be the App token — which cannot dispatch a workflow, an
-            # Actions API write the App's two permissions deliberately
-            # exclude.
+            # whenever a PAT or App token was available but didn't open the
+            # PR (an adopted rerun of a default-token PR), so the ambient
+            # $GH_TOKEN can still be that credential — and docs/PAT.md and
+            # docs/GITHUB_APP.md both scope their credential to Contents +
+            # pull requests only, deliberately excluding Actions:write, so
+            # neither can dispatch a workflow.
             if GH_TOKEN="$DEFAULT_TOKEN" gh workflow run "$CI_WORKFLOW" --ref "$branch" -f pr="$pr"; then
               ci_started=true
             else
@@ -1733,7 +1755,13 @@ jobs:
             fi
             echo "$verdict"
             echo
-            if [ "$app_opened_pr" = 'true' ]; then
+            if [ "$nondefault_opened_pr" = 'true' ] && [ -n "$PAT" ]; then
+              echo '> This pull request was opened under a personal access token'"'"'s'
+              echo '> identity — a real repository collaborator — so this repository'"'"'s'
+              echo '> `on: pull_request` workflows started on it normally, the same as any'
+              echo '> human-opened pull request. Nothing here needed to dispatch them'
+              echo '> separately.'
+            elif [ "$nondefault_opened_pr" = 'true' ]; then
               echo '> This pull request was opened under a GitHub App installation'"'"'s'
               echo '> identity — a real repository collaborator — so this repository'"'"'s'
               echo '> `on: pull_request` workflows started on it normally, the same as any'
@@ -1808,14 +1836,19 @@ jobs:
           # A required `codex` status that never gets set leaves the PR
           # silently stuck until someone notices, which defeats the point of
           # the merge gate, so nudge it explicitly whenever this run opened
-          # the PR under the App. Retried like the body edit above: a rerun
-          # of THIS attempt doesn't get another chance, since a later rerun
-          # adopts the existing PR (adopt=true, pr_opened_here=false) and
-          # app_opened_pr goes false with it — so a nudge that never leaves
-          # this loop is not recoverable except by a human noticing and
-          # commenting manually. Harmless if Codex reacts on its own first
-          # either way — the nudge just asks for a second look.
-          if [ "$app_opened_pr" = 'true' ]; then
+          # the PR under a non-default identity — a PAT's is a real user
+          # account rather than an App or a bot, so it likely gets the
+          # native trigger a human-opened PR does, but that's unconfirmed and
+          # the nudge is harmless when redundant, so it fires either way
+          # rather than betting the merge gate on an assumption. Retried like
+          # the body edit above: a rerun of THIS attempt doesn't get another
+          # chance, since a later rerun adopts the existing PR (adopt=true,
+          # pr_opened_here=false) and nondefault_opened_pr goes false with it
+          # — so a nudge that never leaves this loop is not recoverable
+          # except by a human noticing and commenting manually. Harmless if
+          # Codex reacts on its own first either way — the nudge just asks
+          # for a second look.
+          if [ "$nondefault_opened_pr" = 'true' ]; then
             nudged=false
             for _ in 1 2 3; do
               if gh pr comment "$pr" --body '@codex review'; then

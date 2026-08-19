@@ -1,5 +1,20 @@
 # TODO
 
+## Reconsider later
+
+- **`docs/PAT.md`'s personal access token is the currently used path for
+  authoring the weekly PR, not `docs/GITHUB_APP.md`'s GitHub App** (repo
+  owner decision, 2026-08-19): simpler one-time setup while every consumer
+  is single-owner, at the cost of a broader-blast-radius credential tied to
+  a real user account rather than the App's narrower, independently
+  revocable, per-repo installation. **Switch back once a consumer repository
+  takes external contributions** — a PAT's blast radius matters more once
+  people other than the owner have any access to the repository or its
+  Actions logs. Reversible without a workflow change: both paths are
+  already wired into `gradle-update.yml` (`token` takes priority over
+  `app-id`/`app-private-key` if both are set), so reverting is re-pointing a
+  consumer's `secrets:` block, not touching the reusable workflow.
+
 ## Decisions needing review
 
 Autopilot guesses (2026-08-17), recorded so they get a human look:
