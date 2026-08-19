@@ -17,6 +17,11 @@ rules:
         # be a decision somebody made. Adding one is one line here, plus
         # the table in zizmor.test.js.
         "mikelward/codex-review": ref-pin
+        # Same repository, but the key is matched whole against the `uses:`
+        # value including the workflow path, so the reusable workflow the
+        # consumer-side check calls needs its own entry — the action
+        # reference above does not cover it.
+        "mikelward/codex-review/.github/workflows/check-consumer.yml": ref-pin
         # Official actions may pin to a tag, as ci.yml does. Hash-pinning
         # them instead is a deliberate open question — see the zizmor
         # entry in mikelward/codex-review's TODO.md.
@@ -25,9 +30,16 @@ rules:
         # already does.
         "*": hash-pin
   dangerous-triggers:
-    # The sweep's triggers are load-bearing and reasoned through in the
-    # workflow's own header and in docs/CONSUMER.md of
-    # mikelward/codex-review: it never checks out or executes pull
-    # request code.
+    # Both triggers are load-bearing and reasoned through in
+    # mikelward/codex-review's docs/CONSUMER.md.
     ignore:
+      # The sweep: never checks out or executes pull request code at all.
       - codex-review.yml
+      # The consumer-side check: pull_request_target so the JOB DEFINITION
+      # always loads from the default branch (a bare pull_request would let
+      # a PR editing this file replace the call with one that always
+      # succeeds), and it does check out the PR head — but only to hand it
+      # to check_consumer.py, which parses it as text and executes nothing
+      # from it. See check-consumer.yml in mikelward/codex-review for the
+      # full reasoning.
+      - codex-review-check.yml
