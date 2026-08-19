@@ -89,6 +89,7 @@ test("the policy's pin table is exact", () => {
   // fails here, whichever shape it takes.
   assert.deepEqual(policyEntries(policyRules), [
     "mikelward/codex-review: ref-pin",
+    "mikelward/codex-review/.github/workflows/check-consumer.yml: ref-pin",
     "actions/*: ref-pin",
     "*: hash-pin",
   ]);
@@ -104,11 +105,11 @@ test("the policy reader collects an entry hidden behind an inline comment", () =
   assert.deepEqual(policyEntries(stripComments(fixture)), ["o/r: ref-pin"]);
 });
 
-test("the policy excuses the sweep's triggers for codex-review.yml alone", () => {
+test("the policy excuses pull_request_target only for the two codex-review files", () => {
   // The ignore list is why a NEW workflow reaching for pull_request_target
   // is still flagged. The list items are the only `- ` entries in the
-  // file; compared whole, so nothing rides in beside the one excused
-  // workflow.
+  // file; compared whole, so nothing rides in beside the two excused
+  // workflows.
   const ignored = [...policyRules.matchAll(/^ +- (\S+)$/gm)].map((m) => m[1]);
-  assert.deepEqual(ignored, ["codex-review.yml"]);
+  assert.deepEqual(ignored, ["codex-review.yml", "codex-review-check.yml"]);
 });

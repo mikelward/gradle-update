@@ -117,7 +117,7 @@ costing maintenance:
 
 ## Review and merge gates
 
-- [ ] Add `codex-review-check.yml` (mikelward/codex-review's consumer
+- [x] Add `codex-review-check.yml` (mikelward/codex-review's consumer
       check): Codex reviews run here, but nothing verifies the workflow
       pin the ruleset should require.
 - [ ] Verify the settings half of the fleet's bar: a ruleset on the
