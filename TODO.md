@@ -18,6 +18,14 @@ Autopilot guesses (2026-08-17), recorded so they get a human look:
 - **`ci.yml` actions are now SHA-pinned** (checkout v5.0.1, setup-node
   v6.5.0) to match `gradle-update.yml`'s convention. Undoing is
   reverting to the tags.
+- **`docs/GITHUB_APP.md` recommends reusing `rust-update`'s App instance**
+  rather than registering a separate one for this hub (2026-08-19): the
+  permissions are byte-identical (Contents RW + Pull requests RW), so
+  there's nothing Gradle-specific to isolate by splitting them, and one
+  fewer private key to generate and store. Consumer secrets are still named
+  per-hub (`GRADLE_UPDATE_APP_ID` / `GRADLE_UPDATE_APP_PRIVATE_KEY`) so this
+  is reversible without a doc rewrite — a later separate App is just a new
+  registration plus re-pointing those two secrets, not a workflow change.
 
 ## Alternatives considered and parked
 
@@ -80,6 +88,20 @@ costing maintenance:
 
 ## Known gaps
 
+- **The App-token support is wired hub-side only** (2026-08-19); no consumer
+  repository passes `secrets: app-id/app-private-key` yet, so every one
+  still hits the first-time-contributor approval gate on its own `on:
+  pull_request` workflows via `ci-workflow`'s dispatch fallback. Follows
+  `rust-update`'s `docs/GITHUB_APP.md` setup once a consumer opts in — see
+  that document here, adapted for this hub's secret names.
+- **The strict-policy probe deliberately stays on `github.token`, never the
+  App token**, even when one is minted — added alongside the App-token
+  support, so this is a design choice, not a leftover: `GET
+  rules/branches/{branch}` isn't covered by the App's two documented
+  permissions (Contents + pull requests), and `rust-update` has no analogous
+  probe to have already answered whether adding a third (Administration:
+  read) would even be safe to ask for. Revisit if the App's grant ever
+  changes.
 - **Transitive majors.** No Gradle lockfile in the consumer repos, so a
   same-major direct bump can pull a transitive major with nothing in the
   catalog diff. npm-update's lockfile walker has no analog here yet; the
@@ -117,6 +139,14 @@ costing maintenance:
 
 ## Review and merge gates
 
+- [ ] **Decide whether to pin `actions/create-github-app-token` by SHA**,
+      matching every other third-party action in `gradle-update.yml`
+      (`actions/checkout`, `actions/download-artifact`). Left on `@v2` for
+      now, mirroring `rust-update`'s same open decision — the repo owner is
+      undecided. Worth weighing seriously rather than deferred by default:
+      this is the one action in the file that handles a private key and
+      mints a write-scoped token, arguably the most sensitive thing here to
+      leave unpinned.
 - [x] Add `codex-review-check.yml` (mikelward/codex-review's consumer
       check): Codex reviews run here, but nothing verifies the workflow
       pin the ruleset should require.
