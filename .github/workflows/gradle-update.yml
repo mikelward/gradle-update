@@ -97,12 +97,32 @@ on:
       ci-workflow:
         description: >-
           Workflow file to dispatch against the pushed branch, with a `pr`
-          input naming the pull request — required because a PR opened by
-          GITHUB_TOKEN triggers no `on: pull_request` workflows. It must
-          carry `workflow_dispatch` on the default branch. Empty disables
-          the dispatch.
+          input naming the pull request. A pull request this job opens
+          under GITHUB_TOKEN's identity DOES trigger a consumer's own
+          `on: pull_request` workflows, same as any other — but GitHub gates
+          that run pending manual approval, since GITHUB_TOKEN's identity
+          (`github-actions[bot]`) is not a repository collaborator; nothing
+          runs until someone clicks approve. Dispatch sidesteps the gate
+          (see docs/GITHUB_APP.md for the version-controlled fix: a GitHub
+          App installation, which IS a collaborator). It must carry
+          `workflow_dispatch` on the default branch. Empty disables the
+          dispatch.
         type: string
         default: android-ci.yml
+    secrets:
+      app-id:
+        description: >-
+          A GitHub App's ID, for minting a short-lived installation token to
+          push the branch and open the pull request with instead of
+          GITHUB_TOKEN — see docs/GITHUB_APP.md. Optional; omit both this
+          and app-private-key to keep using GITHUB_TOKEN. Providing one
+          without the other is refused: a partial credential mints no
+          token, and failing loudly beats silently falling back to the
+          weaker one.
+        required: false
+      app-private-key:
+        description: The App's private key (the full .pem contents), paired with app-id.
+        required: false
 
 # Explicitly empty, not omitted: the CALLER grants the real permissions
 # (contents: write, pull-requests: write, actions: write) and every job below
@@ -1025,13 +1045,61 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
+      # This block scopes only the job's own auto-generated GITHUB_TOKEN.
+      # When a consumer supplies app-id/app-private-key below, the token
+      # this job actually uses is a separate GitHub App installation token,
+      # and its effective access comes from the App's OWN permissions (set
+      # at installation — see docs/GITHUB_APP.md), not from this block. Kept
+      # in step with what GITHUB_TOKEN would need regardless, since a
+      # consumer that omits the secrets still runs on it.
       contents: write
       pull-requests: write
       # Dispatching the consumer's CI on the pushed branch is a write to the
       # Actions API — granted HERE and not to the update job, so dependency
       # code can never start a workflow.
       actions: write
+    # Read once into env, not referenced as secrets.app-id / secrets.
+    # app-private-key directly in the if: conditions below — the secrets
+    # context is unavailable there for a reusable workflow's own
+    # workflow_call secrets, so an if: naming them outright would just
+    # never select the intended branch.
+    env:
+      APP_ID: ${{ secrets.app-id }}
+      APP_PRIVATE_KEY: ${{ secrets.app-private-key }}
     steps:
+      # A partial credential mints no token either way; refuse it explicitly
+      # rather than silently falling back to GITHUB_TOKEN, which would read
+      # as "the App is wired up" while actually still hitting the approval
+      # gate docs/GITHUB_APP.md describes.
+      - name: Refuse a half-supplied App credential
+        if: (env.APP_ID == '') != (env.APP_PRIVATE_KEY == '')
+        run: |
+          echo "::error::app-id and app-private-key must both be set, or both left empty — one without the other mints no token."
+          exit 1
+
+      # Optional: a consumer that wired up docs/GITHUB_APP.md gets a
+      # short-lived installation token here instead of GITHUB_TOKEN, so the
+      # pull request this job opens is authored by a real collaborator and
+      # never trips the first-time-contributor approval gate on the
+      # consumer's own on: pull_request workflows — including this job's
+      # own dispatch fallback below, which the App token's identity being a
+      # real collaborator makes unnecessary. Not pinned by SHA yet — see
+      # TODO.md.
+      - name: Mint a GitHub App installation token
+        id: app-token
+        if: env.APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ env.APP_ID }}
+          private-key: ${{ env.APP_PRIVATE_KEY }}
+          # Named explicitly rather than left to inherit the App's whole
+          # installation grant — matches docs/GITHUB_APP.md's two
+          # permissions exactly, so the minted token can never be wider
+          # than what this job actually uses even if the App is later
+          # installed with more (zizmor: github-app).
+          permission-contents: write
+          permission-pull-requests: write
+
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           # The exact commit the update job tested, not the branch tip.
@@ -1189,7 +1257,7 @@ jobs:
 
       - name: Stop if the default branch moved while the checks ran
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           # Data, not script text — an apostrophe is legal in a git ref name.
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           # Env, not inline — see the fingerprint step.
@@ -1220,7 +1288,13 @@ jobs:
       - name: Resolve the branch, then adopt or commit and push
         id: resolve
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          # Always GITHUB_TOKEN, never the App token: the Actions API read
+          # below needs Actions:Read, which docs/GITHUB_APP.md deliberately
+          # does not ask the App to have (Contents + pull requests only).
+          # GITHUB_TOKEN always has it — it is the job that scheduled this
+          # very run.
+          DEFAULT_TOKEN: ${{ github.token }}
           CATALOG: ${{ inputs.catalog }}
           # As a git pathspec the catalog path is data too: `git add` with a
           # filename carrying pathspec syntax (`*`, `?`) would otherwise glob
@@ -1246,8 +1320,9 @@ jobs:
           # after UTC midnight would otherwise compute a different name,
           # miss the earlier attempt's branch, and open a duplicate PR for
           # the same batch. (run_started_at won't do: it moves to the
-          # latest attempt.)
-          created=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at)
+          # latest attempt.) GH_TOKEN overridden for just this command — see
+          # DEFAULT_TOKEN above.
+          created=$(GH_TOKEN="$DEFAULT_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at)
           today=${created%%T*}
           branch="deps/update-$today"
 
@@ -1499,12 +1574,27 @@ jobs:
             echo "validated_head<<$delim"
             printf '%s\n' "$validated_head"
             echo "$delim"
+            echo "adopt<<$delim"
+            printf '%s\n' "$adopt"
+            echo "$delim"
           } >> "$GITHUB_OUTPUT"
 
       - name: Open the pull request
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           CI_WORKFLOW: ${{ inputs.ci-workflow }}
+          # Whether THIS run minted an App token — not whether the pull
+          # request it ends up using was actually opened with one. An
+          # adopted rerun can reuse a PR an earlier, non-App attempt opened;
+          # the script below derives the real app_opened_pr from this plus
+          # whether the resolve step pushed or this step creates the PR
+          # itself.
+          APP_TOKEN_USED: ${{ steps.app-token.outputs.token != '' }}
+          # Always GITHUB_TOKEN, never the App token — see the resolve
+          # step's DEFAULT_TOKEN comment. Used here for the Actions-API
+          # dispatch and the branch-rules probe, neither of which the App's
+          # two permissions (Contents + pull requests) cover.
+          DEFAULT_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PASSED: ${{ needs.update.outputs.passed }}
           REVIEW_FLAGGED: ${{ needs.update.outputs.review_flagged }}
@@ -1512,29 +1602,30 @@ jobs:
           RESOLVED_TITLE: ${{ steps.resolve.outputs.title }}
           RESOLVED_VERDICT: ${{ steps.resolve.outputs.verdict }}
           RESOLVED_HEAD: ${{ steps.resolve.outputs.validated_head }}
+          RESOLVED_ADOPT: ${{ steps.resolve.outputs.adopt }}
         run: |
           set -euo pipefail
           branch="$RESOLVED_BRANCH"
           title="$RESOLVED_TITLE"
           verdict="$RESOLVED_VERDICT"
           validated_head="$RESOLVED_HEAD"
+          adopt="$RESOLVED_ADOPT"
 
-          # A PR opened by GITHUB_TOKEN triggers no `on: pull_request`
-          # workflows, so nothing would start CI on this branch by itself.
-          # `workflow_dispatch` is the documented exception — a dispatch made
-          # with GITHUB_TOKEN does create a run — so ask for one explicitly
-          # against the branch just pushed, naming the PR so the consumer's
-          # docs lane can bind the run to it. Non-fatal either way: the
-          # branch is pushed and the update job has already run every check,
-          # so a failed dispatch must not turn a pushed branch into no PR —
-          # but it is reported in the PR BODY, because "CI never started" and
-          # "CI passed quietly" look identical from the PR otherwise.
-          # Only a PR still based on the default branch may be reused: the
-          # adoption checks compared the branch's tree against that base, so
-          # a PR someone retargeted would merge the verified catalog into a
+          # A PR opened under GITHUB_TOKEN's identity DOES trigger a
+          # consumer's own `on: pull_request` workflows, same as any other —
+          # but GitHub gates that run pending manual approval, since
+          # GITHUB_TOKEN's identity (github-actions[bot]) is not a
+          # repository collaborator, and nothing runs until someone clicks
+          # approve (docs/GITHUB_APP.md). Dispatch sidesteps the gate: ask
+          # for one explicitly against the branch just pushed, naming the PR
+          # so the consumer's docs lane can bind the run to it. Only a PR
+          # still based on the default branch may be reused: the adoption
+          # checks compared the branch's tree against that base, so a PR
+          # someone retargeted would merge the verified catalog into a
           # branch nobody validated against. A retargeted PR is left alone
           # and a fresh, correctly-based one is opened beside it (GitHub
           # allows one open PR per head+base pair, so the create succeeds).
+          pr_opened_here=false
           pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?head=${GITHUB_REPOSITORY_OWNER}:${branch}&state=open" \
             --jq '[.[] | select(.base.ref == env.DEFAULT_BRANCH)][0].number // empty')
           if [ -z "$pr" ]; then
@@ -1542,6 +1633,24 @@ jobs:
               --body 'Opening — the checks report lands in a moment.' \
               --base "$DEFAULT_BRANCH" --head "$branch")
             pr=${pr_url##*/}
+            pr_opened_here=true
+          fi
+
+          # APP_TOKEN_USED says only that THIS invocation minted an App
+          # token — not that the pull request open above actually used it.
+          # An adopted rerun (adopt=true) reuses whatever PR an EARLIER
+          # attempt already opened, possibly under GITHUB_TOKEN if App
+          # credentials were added between attempts, with no push and no
+          # `gh pr create` of its own to carry the App's identity. Only
+          # trust the native trigger when this run itself did one of the
+          # two things that puts the App's identity on the wire: pushed the
+          # branch fresh (adopt != true, in the resolve step) or created the
+          # pull request here (pr_opened_here). Otherwise fall back to
+          # dispatching same as the no-App case — a possibly-redundant CI
+          # run is far cheaper than one that silently never starts.
+          app_opened_pr=false
+          if [ "$APP_TOKEN_USED" = 'true' ] && { [ "$adopt" != true ] || [ "$pr_opened_here" = true ]; }; then
+            app_opened_pr=true
           fi
 
           # Clear any stale auto-merge from a prior attempt NOW, before the
@@ -1566,8 +1675,15 @@ jobs:
           fi
 
           ci_started=false
-          if [ -n "$CI_WORKFLOW" ]; then
-            if gh workflow run "$CI_WORKFLOW" --ref "$branch" -f pr="$pr"; then
+          if [ "$app_opened_pr" != 'true' ] && [ -n "$CI_WORKFLOW" ]; then
+            # GH_TOKEN overridden to $DEFAULT_TOKEN here too, same as the
+            # actions/runs read in the resolve step: this branch runs
+            # whenever an App token was minted but didn't open the PR (an
+            # adopted rerun of a non-App PR), so the ambient $GH_TOKEN can
+            # still be the App token — which cannot dispatch a workflow, an
+            # Actions API write the App's two permissions deliberately
+            # exclude.
+            if GH_TOKEN="$DEFAULT_TOKEN" gh workflow run "$CI_WORKFLOW" --ref "$branch" -f pr="$pr"; then
               ci_started=true
             else
               echo "Could not start CI on $branch; the PR body says so." >> "$GITHUB_STEP_SUMMARY"
@@ -1617,17 +1733,28 @@ jobs:
             fi
             echo "$verdict"
             echo
-            if [ "$ci_started" = true ]; then
-              echo '> These ran in the workflow job, not on this PR. A PR opened by'
-              echo '> `GITHUB_TOKEN` does not trigger `on: pull_request` workflows, so CI'
-              echo "> does not start here on its own — this job dispatched \`$CI_WORKFLOW\`"
-              echo '> against the branch instead, and that run reports on this PR like any'
-              echo '> other.'
+            if [ "$app_opened_pr" = 'true' ]; then
+              echo '> This pull request was opened under a GitHub App installation'"'"'s'
+              echo '> identity — a real repository collaborator — so this repository'"'"'s'
+              echo '> `on: pull_request` workflows started on it normally, the same as any'
+              echo '> human-opened pull request. Nothing here needed to dispatch them'
+              echo '> separately.'
+            elif [ "$ci_started" = true ]; then
+              echo '> These ran in the workflow job, not on this PR. A pull request opened'
+              echo '> under GITHUB_TOKEN'"'"'s identity does trigger this repository'"'"'s own'
+              echo '> `on: pull_request` workflows, same as any other — but GitHub gates that'
+              echo '> run pending manual approval, since that identity is not a repository'
+              echo "> collaborator. This job dispatched \`$CI_WORKFLOW\` against the branch"
+              echo '> instead, which sidesteps the gate, and that run reports on this PR like'
+              echo '> any other.'
             else
-              echo '> **CI was not started on this branch, so the checks above are the only'
-              echo '> ones that ran.** A PR opened by `GITHUB_TOKEN` does not trigger'
-              echo '> `on: pull_request` workflows, and no dispatch succeeded. Push any'
-              echo '> commit to the branch and CI runs normally from then on.'
+              echo '> **CI was not started on this branch by this job, so the checks above'
+              echo '> are the only ones that ran here.** A pull request opened under'
+              echo '> GITHUB_TOKEN'"'"'s identity does trigger this repository'"'"'s own'
+              echo '> `on: pull_request` workflows, but GitHub gates that run pending manual'
+              echo '> approval — check this pull request'"'"'s checks tab for one waiting on'
+              echo '> that, or push any commit to the branch and CI runs normally from then'
+              echo '> on.'
             fi
             echo
             echo '## Changed'
@@ -1674,6 +1801,35 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          # mesh#533, the first PR rust-update's copy of this workflow ever
+          # opened under the App's identity, got no automatic Codex review —
+          # the connector's webhook trigger apparently doesn't fire for an
+          # App-authored PR the way it does for a human or GITHUB_TOKEN one.
+          # A required `codex` status that never gets set leaves the PR
+          # silently stuck until someone notices, which defeats the point of
+          # the merge gate, so nudge it explicitly whenever this run opened
+          # the PR under the App. Retried like the body edit above: a rerun
+          # of THIS attempt doesn't get another chance, since a later rerun
+          # adopts the existing PR (adopt=true, pr_opened_here=false) and
+          # app_opened_pr goes false with it — so a nudge that never leaves
+          # this loop is not recoverable except by a human noticing and
+          # commenting manually. Harmless if Codex reacts on its own first
+          # either way — the nudge just asks for a second look.
+          if [ "$app_opened_pr" = 'true' ]; then
+            nudged=false
+            for _ in 1 2 3; do
+              if gh pr comment "$pr" --body '@codex review'; then
+                nudged=true
+                break
+              fi
+              sleep 5
+            done
+            if [ "$nudged" != true ]; then
+              echo "Could not post the @codex review nudge on #$pr after 3 attempts — it needs a manual \`@codex review\` comment." \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
           # Arm auto-merge so a clean batch lands unattended; the ruleset's
           # required checks do the reviewing. ONLY when this run's own checks
           # passed: auto-merge waits for the ruleset's requirements, and a
@@ -1705,8 +1861,13 @@ jobs:
           # rulesets API; the ruleset is how these repos protect main.)
           # The rules list is paginated; --paginate --slurp gathers every
           # page into one array of pages, so a rule past page one cannot
-          # read as "policy absent".
-          strict=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/rules/branches/$(printf %s "$DEFAULT_BRANCH" | jq -sRr @uri)" \
+          # read as "policy absent". GH_TOKEN overridden to $DEFAULT_TOKEN
+          # here too, same as the Actions-API sites above: this is a read no
+          # write is riding on, and docs/GITHUB_APP.md deliberately keeps
+          # the App to two permissions (Contents + pull requests) rather
+          # than adding a third just to cover this one diagnostic query —
+          # GITHUB_TOKEN already reads it today, unmodified by this port.
+          strict=$(GH_TOKEN="$DEFAULT_TOKEN" gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/rules/branches/$(printf %s "$DEFAULT_BRANCH" | jq -sRr @uri)" \
             | jq '[.[][] | select(.type == "required_status_checks")
                          | .parameters.strict_required_status_checks_policy] | any') || strict=false
           if [ "$PASSED" = 'true' ] && [ "$REVIEW_FLAGGED" != 'true' ] && [ "$strict" = 'true' ]; then

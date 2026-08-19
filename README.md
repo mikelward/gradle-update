@@ -96,10 +96,21 @@ Inputs (all optional): `catalog`, `cooldown-days`, `java-version`, `checks`
 `review-checks` (commands one per line, default empty — see below),
 `commit-prefix` (default `internal:`, the Android repos' release-notes
 filter; the web repos use `deps:`), and `ci-workflow` (default
-`android-ci.yml`) — the consumer workflow dispatched against the pushed
-branch, needed because a PR opened by `GITHUB_TOKEN` triggers no
-`on: pull_request` workflows. It must carry `workflow_dispatch` with a `pr`
-input on the consumer's default branch; set it empty to disable.
+`android-ci.yml`) — a consumer workflow dispatched against the pushed
+branch. A pull request opened under GITHUB_TOKEN's identity DOES trigger a
+consumer's own `on: pull_request` workflows, same as any other, but GitHub
+gates that run pending manual approval, since that identity is not a
+repository collaborator; dispatch sidesteps the gate. It must carry
+`workflow_dispatch` with a `pr` input on the consumer's default branch; set
+it empty to disable.
+
+Two optional secrets, `app-id` and `app-private-key`, let a consumer supply
+a GitHub App installation instead of GITHUB_TOKEN — an App installation IS a
+collaborator, so the pull requests it opens never hit the approval gate in
+the first place, and `ci-workflow` becomes unnecessary. See
+[`docs/GITHUB_APP.md`](docs/GITHUB_APP.md) for the one-time setup. Providing
+one secret without the other is refused: a partial credential mints no
+token.
 
 **Unattended landing needs the ruleset to require branches up to date**
 (strict required status checks). The publish job verifies that policy
@@ -126,8 +137,11 @@ publish.
 ## Testing
 
 ```
-node --test update-versions.test.js check-gradle-update.test.js
+node --test *.test.js
 ```
 
 No install step: the engine and its suite are dependency-free on purpose, so
 what runs inside a consumer's workflow is exactly what a reader reads here.
+`workflow.test.js` covers the App-token and Codex-nudge shell logic inside
+`gradle-update.yml` itself, the same regex-over-raw-text convention as
+`zizmor.test.js`.
