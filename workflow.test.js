@@ -5,7 +5,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, symlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const workflow = readFileSync(".github/workflows/gradle-update.yml", "utf8");
 
@@ -153,4 +156,415 @@ test("a PAT- or App-opened PR gets an explicit @codex review nudge, retried like
   // recovery path.
   const nudge = /if \[ "\$nondefault_opened_pr" = 'true' \]; then\s*\n\s*nudged=false\s*\n\s*for _ in 1 2 3; do\s*\n\s*if gh pr comment "\$pr" --body '@codex review'; then/;
   assert.match(workflow, nudge, "the retried @codex review nudge, gated on nondefault_opened_pr, was not found");
+});
+
+// The tree-check gates (the regenerate step's pretree check, the review
+// checks step's treestate()/preplanted, and the final "Verify only the
+// catalog changed" step) all read `git status --porcelain -z` through a
+// direct pipe under `shopt -s lastpipe`, classifying each whole
+// NUL-terminated record. This guards against bugs earlier forms had, at
+// every one of those six call sites: a `tr '\0' '\n'` conversion let an
+// untracked filename with an embedded newline split into two lines and
+// hide behind an allowlist entry (verified directly: a file named
+// "\nXXXchecks.md" vanished completely under that pipeline, `pretree`
+// coming back empty even though the file was there); a trailing `|| true`
+// swallowed a genuine `git status` failure the same way it swallowed
+// grep's ordinary no-matches exit 1; and — the reason these are pipes and
+// not scratch files, per Codex's review of an interim mktemp fix —
+// reading a scratch file back by NAME reopens a window between the write
+// and the read for anything already watching $RUNNER_TEMP to swap its
+// content, which mktemp's unpredictable name narrows but does not close.
+test("every tree-check reads NUL-terminated records through a direct pipe, not a tr-joined `|| true` pipe or a scratch file", () => {
+  const riskyJoin = /git status --porcelain[^\n]*\\\n[^\n]*\| tr '\\\\0'/;
+  assert.doesNotMatch(workflow, riskyJoin, "a git-status-into-tr pipeline reappeared — see gradle-update-nul-safety fix");
+  assert.doesNotMatch(workflow, /git status --porcelain -z[^\n]*> "\$[A-Za-z_]+"/, "a bare git-status-into-file redirect reappeared — see the direct-pipe fix");
+
+  const readLoops = [...workflow.matchAll(/while IFS= read -r -d '' entry; do/g)];
+  assert.equal(readLoops.length, 6, `expected 6 NUL-record read loops, found ${readLoops.length}`);
+});
+
+// Extracts the regenerate step's pretree/preplanted block from the real
+// file text (not a hand-copied literal) so a future edit that reintroduces
+// either bug, or removes the fix, breaks this test rather than drifting
+// unnoticed.
+function extractPretreeBlock(text) {
+  const startMarker = 'allow=("$CATALOG" report.md checks.md deps-stat.txt)';
+  const start = text.indexOf(startMarker);
+  assert.notEqual(start, -1, "pretree block start marker not found in gradle-update.yml");
+  const ifMarker = 'if [ -n "$pretree" ] || [ -n "$preplanted" ]; then';
+  const ifStart = text.indexOf(ifMarker, start);
+  assert.notEqual(ifStart, -1, "pretree block's closing if not found");
+  const fiEnd = text.indexOf("\n          fi\n", ifStart);
+  assert.notEqual(fiEnd, -1, "pretree block's closing fi not found");
+  const raw = text.slice(start, fiEnd + "\n          fi".length);
+  return raw.replace(/^ {10}/gm, "");
+}
+
+const pretreeBlock = extractPretreeBlock(workflow);
+
+function runPretreeBlock(repoDir, runnerTemp, catalog, extraPath = "") {
+  // shopt -s lastpipe first: the real step sets it one line above where
+  // this extraction starts, and the block now pipes git status directly
+  // into its read loops — without lastpipe those loops run in a subshell
+  // and $pretree/$preplanted never escape it, so this check would always
+  // read as empty regardless of what changed.
+  const script = `shopt -s lastpipe\nset -euo pipefail\ncd "$1"\nCATALOG="$2"\nRUNNER_TEMP="$3"\n${pretreeBlock}\necho OK\n`;
+  const env = { ...process.env, PATH: `${extraPath}${extraPath ? ":" : ""}${process.env.PATH}` };
+  return execFileSync("bash", ["-c", script, "bash", repoDir, catalog, runnerTemp], { encoding: "utf8", env });
+}
+
+function initRepo(dir) {
+  mkdirSync(dir, { recursive: true });
+  const git = (...args) => execFileSync("git", args, { cwd: dir });
+  git("init", "-q");
+  git("config", "user.email", "test@example.com");
+  git("config", "user.name", "test");
+  mkdirSync(join(dir, "gradle"));
+  writeFileSync(join(dir, "gradle", "libs.versions.toml"), "x");
+  writeFileSync(join(dir, "checks.md"), "x");
+  writeFileSync(join(dir, "deps-stat.txt"), "x");
+  writeFileSync(join(dir, "report.md"), "x");
+  git("add", "gradle/libs.versions.toml", "checks.md", "deps-stat.txt", "report.md");
+  git("commit", "-q", "-m", "init");
+}
+
+test("the pretree check passes on a clean tree", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "gradle-update-pretree-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "gradle-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    const out = runPretreeBlock(repoDir, runnerTemp, "gradle/libs.versions.toml");
+    assert.match(out, /OK/);
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+test("the pretree check catches an untracked file whose name hides a second record behind an embedded newline", () => {
+  // Reproduces the false pass the old `tr '\0' '\n'` pipeline had: a file
+  // named "\nXXXchecks.md" (a newline, then "XXXchecks.md") splits into
+  // "?? " (stripped to empty) and "XXXchecks.md" (stripped to "checks.md",
+  // an exact allowlist match) once NUL is joined into newlines and every
+  // resulting line has its 3-character status prefix stripped — the old
+  // pipeline reported an empty pretree for a tree that was not clean.
+  const repoDir = mkdtempSync(join(tmpdir(), "gradle-update-pretree-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "gradle-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    writeFileSync(join(repoDir, "\nXXXchecks.md"), "x");
+    assert.throws(
+      () => runPretreeBlock(repoDir, runnerTemp, "gradle/libs.versions.toml"),
+      /The checks changed the tree/,
+      "the adversarial untracked file was not detected — the NUL-safety fix regressed",
+    );
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+test("the pretree check fails closed when git status itself fails, instead of the trailing `|| true` swallowing it", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "gradle-update-pretree-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "gradle-update-runnertemp-"));
+  const binDir = mkdtempSync(join(tmpdir(), "gradle-update-fakegit-"));
+  try {
+    initRepo(repoDir);
+    const realGit = execFileSync("command", ["-v", "git"], { shell: "/bin/bash", encoding: "utf8" }).trim();
+    const shim = `#!/bin/sh\nif [ "$1" = status ]; then echo "fatal: fake git status failure" >&2; exit 128; fi\nexec "${realGit}" "$@"\n`;
+    const shimPath = join(binDir, "git");
+    writeFileSync(shimPath, shim);
+    chmodSync(shimPath, 0o755);
+    assert.throws(
+      () => runPretreeBlock(repoDir, runnerTemp, "gradle/libs.versions.toml", binDir),
+      (err) => {
+        // A swallowed failure would exit 0 with "OK\n" as stdout; the fix
+        // must exit nonzero and never reach that echo.
+        assert.notEqual(err.status, 0, "a fake git-status failure did not stop the script — the status-swallow fix regressed");
+        assert.doesNotMatch(err.stdout?.toString() ?? "", /OK/, "the script reached its success echo despite git status failing");
+        return true;
+      },
+    );
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+// treestate() (the review-checks step's helper, called via `pre=$(treestate)`
+// and `changed=$(treestate)`) needs its own coverage beyond the pretree
+// block above: wrapping the NUL-safe git-status read inside a FUNCTION that
+// is then invoked through command substitution reopens the status-swallow
+// bug in a subtler form. Bash does not propagate a mid-function command
+// failure through `set -e` into the assignment that calls the function —
+// verified directly (`f() { false; echo after; }; x=$(f)` under `set -e`
+// still reaches "after" and exits 0) — so `git status ... || return` inside
+// the function is required, not optional; a bare statement identical to the
+// other five call sites would silently pass here.
+function extractTreestateBlock(text) {
+  const startMarker = 'exempt=("$CATALOG" checks.md deps-stat.txt report.md)';
+  const start = text.indexOf(startMarker);
+  assert.notEqual(start, -1, "treestate block start marker not found in gradle-update.yml");
+  // Anchored to the exact top-level-statement indentation (10 spaces): the
+  // function's own comment above its git status call mentions
+  // "pre=$(treestate)" too, inside a backtick-quoted aside, and a plain
+  // indexOf would find that mention first instead of the real call below
+  // the function definition.
+  const preMarker = '\n          pre=$(treestate "$pre_z")';
+  const preIdx = text.indexOf(preMarker, start);
+  assert.notEqual(preIdx, -1, 'pre=$(treestate "$pre_z") call not found after the exempt array');
+  const raw = text.slice(start, preIdx + preMarker.length);
+  return raw.replace(/^ {10}/gm, "");
+}
+
+const treestateBlock = extractTreestateBlock(workflow);
+
+test("treestate() propagates a git-status failure through set -e via an explicit `|| return` on the pipe itself", () => {
+  assert.match(
+    treestateBlock,
+    /git status --porcelain -z --untracked-files=all --no-renames \| while IFS= read -r -d '' entry; do[\s\S]*?done \|\| return/,
+    "treestate()'s git-status pipe must end in `|| return` — see this test's header comment for why a bare pipeline does not propagate the failure",
+  );
+});
+
+test("a git-status failure inside treestate() stops the review-checks step instead of being swallowed", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "gradle-update-treestate-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "gradle-update-runnertemp-"));
+  const binDir = mkdtempSync(join(tmpdir(), "gradle-update-fakegit-"));
+  try {
+    initRepo(repoDir);
+    const realGit = execFileSync("command", ["-v", "git"], { shell: "/bin/bash", encoding: "utf8" }).trim();
+    const shim = `#!/bin/sh\nif [ "$1" = status ]; then echo "fatal: fake git status failure" >&2; exit 128; fi\nexec "${realGit}" "$@"\n`;
+    const shimPath = join(binDir, "git");
+    writeFileSync(shimPath, shim);
+    chmodSync(shimPath, 0o755);
+    const script = `shopt -s lastpipe\nset -euo pipefail\ncd "$1"\nCATALOG="$2"\nRUNNER_TEMP="$3"\nREGEN_SHA=""\nREGENERATED_FILES=""\n${treestateBlock}\necho "REACHED pre=[$pre]"\n`;
+    const env = { ...process.env, PATH: `${binDir}:${process.env.PATH}` };
+    assert.throws(
+      () => execFileSync("bash", ["-c", script, "bash", repoDir, "gradle/libs.versions.toml", runnerTemp], { encoding: "utf8", env }),
+      (err) => {
+        assert.notEqual(err.status, 0, "a fake git-status failure inside treestate() did not stop the step");
+        assert.doesNotMatch(err.stdout?.toString() ?? "", /REACHED/, "the step reached past pre=$(treestate) despite git status failing inside it");
+        return true;
+      },
+    );
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+// capture_and_restore() (the per-review-command capture/restore helper)
+// consumes treestate()'s changed-file list through two more read loops of
+// its own — the diff-report loop and the restore loop. Both needed the same
+// NUL-delimited treatment: re-serializing treestate()'s result as a
+// newline-joined string and reading it back with `while IFS= read -r f`
+// would still split a file with an embedded newline in its name into two
+// fragments there, reopening the same failure mode one step downstream of
+// where the tree-check gates themselves were fixed (Codex found this on a
+// review of the treestate() fix above).
+test("capture_and_restore fully restores a file whose name contains an embedded newline, as one record not two", () => {
+  const startMarker = 'exempt=("$CATALOG" checks.md deps-stat.txt report.md)';
+  const start = workflow.indexOf(startMarker);
+  assert.notEqual(start, -1, "capture_and_restore block start marker not found");
+  const closeMarker = "\n          }\n";
+  const closeIdx = workflow.indexOf(closeMarker, workflow.indexOf("capture_and_restore() {", start));
+  assert.notEqual(closeIdx, -1, "capture_and_restore's closing brace not found");
+  const block = workflow.slice(start, closeIdx + closeMarker.length).replace(/^ {10}/gm, "");
+
+  const repoDir = mkdtempSync(join(tmpdir(), "gradle-update-restore-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "gradle-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    const script = `shopt -s lastpipe
+set -euo pipefail
+cd "$1"
+CATALOG="$2"
+RUNNER_TEMP="$3"
+REGEN_SHA=""
+REGENERATED_FILES=""
+REVIEW_CHECKS=""
+${block}
+printf 'x' > "$(printf '\\nweirdfile.txt')"
+budget=100000
+omitted=0
+REVIEW_TMP="$RUNNER_TEMP/review.md"
+: > "$REVIEW_TMP"
+capture_and_restore 'test-command'
+echo "DIRTY_BYTES=$(git status --porcelain -z --untracked-files=all | wc -c)"
+`;
+    const out = execFileSync("bash", ["-c", script, "bash", repoDir, "gradle/libs.versions.toml", runnerTemp], { encoding: "utf8" });
+    assert.match(out, /DIRTY_BYTES=0/, `tree was not fully restored after capture_and_restore — got: ${out}`);
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+// Every scratch file this fix writes through `>` (which follows an
+// existing symlink) needs an unpredictable name: dependency and plugin
+// code ran earlier in the same job and inherits $RUNNER_TEMP, so a FIXED
+// name is something that code could pre-create as a symlink before the
+// redirect runs — to a workflow-owned report (corrupting it while the
+// allowlist still exempts it), or to /dev/null (making the check always
+// read as a clean tree). Codex found this on review of the NUL-safety fix
+// above; verified directly below with the exact /dev/null shape it
+// described.
+// Superseded by the direct-pipe redesign below (Codex found a second round:
+// even an unpredictable mktemp'd name is still reopened by pathname a
+// moment after git status writes it, a window something already watching
+// $RUNNER_TEMP could in principle win). The write-once-read-once checks
+// (pretree, both preplanted passes, treestate()'s own internal status
+// read, unexpected, planted) now pipe directly with no file at all. Only
+// two mktemp'd files remain, both for a genuine cross-boundary need a pipe
+// can't serve: pre_z and treestate_list are written by treestate() inside
+// a `$(...)` subshell and read back afterward by the calling shell (once
+// immediately for pre_z, twice at separate points with real work between
+// for treestate_list in capture_and_restore) — documented as a narrower
+// residual gap in the comment above pre_z's declaration, the same way
+// mikelward/npm-update documents its own checks.md/deps-stat.txt gap.
+test("every tree-check reads through a direct pipe, not a fixed or mktemp'd scratch file — except the two that must cross a $(...) boundary", () => {
+  const fixedName = /_z="\$RUNNER_TEMP\/gradle-update-[a-z-]+\.nul"/;
+  assert.doesNotMatch(workflow, fixedName, "a fixed (predictable) scratch-file path reappeared — see the mktemp fix");
+
+  const mktemps = [...workflow.matchAll(/\$\(mktemp "\$RUNNER_TEMP\/gradle-update-[a-z-]+-XXXXXX\.nul"\)/g)];
+  assert.equal(mktemps.length, 2, `expected exactly 2 remaining mktemp'd files (pre_z, treestate_list — the two that must survive a $(...) boundary), found ${mktemps.length}`);
+
+  const pipes = [...workflow.matchAll(/git status --porcelain -z [^\n|]*\| while IFS= read -r -d '' entry; do/g)];
+  assert.equal(pipes.length, 6, `expected 6 direct git-status-into-while pipes (pretree, preplanted ×2, treestate, unexpected, planted), found ${pipes.length}`);
+
+  const lastpipes = [...workflow.matchAll(/^\s*shopt -s lastpipe\s*$/gm)];
+  assert.equal(lastpipes.length, 3, `expected shopt -s lastpipe on all 3 steps with a tree-check pipe, found ${lastpipes.length}`);
+});
+
+test("planting a symlink at the OLD fixed pretree path no longer touches checks.md", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "gradle-update-symlink-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "gradle-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    const checksPath = join(repoDir, "checks.md");
+    const before = readFileSync(checksPath, "utf8");
+    // The exact path the pre-mktemp code used, unconditionally, every run.
+    symlinkSync(checksPath, join(runnerTemp, "gradle-update-pretree.nul"));
+    const out = runPretreeBlock(repoDir, runnerTemp, "gradle/libs.versions.toml");
+    assert.match(out, /OK/);
+    assert.equal(readFileSync(checksPath, "utf8"), before, "checks.md was overwritten through a symlink at the old predictable scratch-file path");
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+// treestate()'s human-readable stdout return has one more sharp edge
+// beyond the ones already covered: command substitution strips ALL
+// trailing newlines, not just the single one `${out%$'\n'}` trims — so a
+// path made ENTIRELY of newline characters (a legal Linux filename)
+// collapses `$(treestate ...)`'s result to the empty string even though a
+// real, non-exempt file exists. Verified directly:
+// `f() { printf '%s' "$(printf '\n\n')"; }; x=$(f); echo ${#x}` prints 0.
+// Codex found this on review of the earlier NUL-safety fix — the emptiness
+// checks at both call sites now test the NUL-delimited list file's size
+// (`-s`), which never crosses that boundary, instead of the string.
+test("the emptiness check at both treestate() call sites tests the NUL list file, not the command-substitution string", () => {
+  assert.match(
+    workflow,
+    /if \[ -s "\$pre_z" \] \|\| \[ -n "\$preplanted" \]; then/,
+    "the pre-check gate must test -s \"$pre_z\", not -n \"$pre\"",
+  );
+  assert.match(
+    workflow,
+    /if \[ ! -s "\$treestate_list" \]; then/,
+    "capture_and_restore's emptiness check must test ! -s \"$treestate_list\", not -z \"$changed\"",
+  );
+});
+
+test("a file named entirely of newline characters is still caught, even though it collapses treestate()'s string return to empty", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "gradle-update-allnewline-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "gradle-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    // $'\n\n', not $(printf '\n\n'): the latter is itself command
+    // substitution and would strip the very newlines this test needs to
+    // plant — the same collapse this test exists to catch, one layer up.
+    writeFileSync(join(repoDir, "\n\n"), "x");
+    assert.throws(
+      () => runPretreeBlock(repoDir, runnerTemp, "gradle/libs.versions.toml"),
+      /The checks changed the tree/,
+      "an untracked file named entirely of newlines was not detected",
+    );
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+// A false pipefail trip found on review of the direct-pipe fix (first
+// caught on the identical construct in mikelward/rust-update): the loop's
+// per-record `[ "$keep" -eq 1 ] && var="$var$path"\n` used the LAST
+// record's own test as the loop's own exit status once the git-status pipe
+// made it part of a pipeline — an ALLOWLISTED record (keep=0, the common
+// case: every normal run's own modified catalog and report files) makes
+// that `[ ]` test false, so under `pipefail` the whole pipe — and the
+// step, under `set -e` — would exit nonzero on every ordinary run, even
+// with nothing actually wrong. Verified directly: `shopt -s lastpipe; set
+// -eo pipefail; printf 'a\0' | while IFS= read -r -d '' e; do [ 0 -eq 1 ]
+// && x=1; done; echo unreached` never reaches "unreached". Fixed with
+// `if`/`fi` (always exits 0 when its condition is false), not
+// `[ ... ] &&`.
+test("a normal run with only allowlisted changes does not abort the pretree check", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "gradle-update-allowlisted-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "gradle-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    // The two ordinary things a real batch changes: the catalog itself,
+    // and the report the earlier checks step already wrote.
+    writeFileSync(join(repoDir, "gradle", "libs.versions.toml"), "y");
+    writeFileSync(join(repoDir, "checks.md"), "y");
+    const out = runPretreeBlock(repoDir, runnerTemp, "gradle/libs.versions.toml");
+    assert.match(out, /OK/, "a run with only allowlisted changes aborted instead of passing");
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+test("--no-renames is present on every git status -z invocation", () => {
+  const calls = [...workflow.matchAll(/git status --porcelain -z [^\n|]*\|/g)].map((m) => m[0]);
+  assert.equal(calls.length, 6, `expected 6 git status -z invocations, found ${calls.length}`);
+  for (const call of calls) {
+    assert.match(call, /--no-renames/, `git status -z call missing --no-renames: ${call}`);
+  }
+});
+
+test("a staged rename onto an allowlisted destination doesn't hide the source path going missing", () => {
+  // Without --no-renames, `git status --porcelain -z` on a staged rename
+  // emits the destination as a normal "XY path" record and the SOURCE as a
+  // bare path with no status prefix at all — `${entry:3}` strips the first
+  // 3 bytes of every record uniformly, so on that second, prefix-less
+  // field it eats 3 bytes of the real old path instead. Renaming
+  // "XXXchecks.md" onto "checks.md" corrupts the old-path field into
+  // "checks.md" too, landing it on the allowlist and hiding the rename
+  // entirely. Found by Codex on mikelward/rust-update's identical
+  // construct; ported here since gradle-update's untracked-files passes
+  // share the same shape.
+  const repoDir = mkdtempSync(join(tmpdir(), "gradle-update-rename-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "gradle-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    const git = (...args) => execFileSync("git", args, { cwd: repoDir });
+    writeFileSync(join(repoDir, "XXXchecks.md"), "some content long enough for git to treat this as a rename rather than an add+delete pair");
+    git("add", "XXXchecks.md");
+    git("commit", "-q", "-m", "add XXXchecks.md");
+    git("mv", "-f", "XXXchecks.md", "checks.md");
+    assert.throws(
+      () => runPretreeBlock(repoDir, runnerTemp, "gradle/libs.versions.toml"),
+      /The checks changed the tree/,
+      "a staged rename was not detected — the source path (XXXchecks.md) went missing without --no-renames",
+    );
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
 });

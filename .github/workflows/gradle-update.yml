@@ -389,6 +389,7 @@ jobs:
           CATALOG: ${{ inputs.catalog }}
           GIT_LITERAL_PATHSPECS: '1'
         run: |
+          shopt -s lastpipe
           set -euo pipefail
           # The declaration is load-bearing — it is the commit allowlist —
           # so an empty one is a configuration error, not a default.
@@ -477,15 +478,82 @@ jobs:
           # review-checks step below runs, exempting only the catalog and
           # the reports already written by earlier steps — not the declared
           # files, since regeneration has not run yet to earn that.
-          pretree=$(git status --porcelain -z --untracked-files=all --no-renames \
-            | tr '\0' '\n' | sed '/^$/d' | sed 's/^...//' \
-            | grep -Fxv -e "$CATALOG" -e report.md -e checks.md -e deps-stat.txt || true)
-          preplanted=$(git status --porcelain -z --ignored \
-            | tr '\0' '\n' | sed '/^$/d' \
-            | grep '^!! ' \
-            | sed 's/^!! //' \
-            | grep -Ev '^((.*/)?\.gradle/|(.*/)?\.kotlin/|local\.properties$|(.*/)?build/)' \
-            | grep -Fxv -e report.md -e checks.md -e deps-stat.txt || true)
+          # git status runs as its own bare command into a temp file, not
+          # piped straight into a chain ending `|| true`: a blanket
+          # `|| true` on a longer pipe swallows a genuine git-status
+          # failure (a corrupted .git — the Gradle build that already ran
+          # above could induce one) exactly as readily as it swallows
+          # grep's ordinary no-matches exit 1, so a corrupted git state
+          # would read as "nothing dirty" and let this gate silently pass
+          # instead of catching exactly what it exists to catch. Each
+          # NUL-terminated record is read whole with `read -r -d ''`, not
+          # joined into a `tr '\0' '\n'` stream and re-split with sed — a
+          # planted filename carrying an embedded newline would otherwise
+          # masquerade as two lines, one of which could satisfy an
+          # allowlist and hide the other. And membership is a `case`/loop
+          # comparison, not grep: grep is line-oriented, so testing one
+          # path value that itself contains an embedded newline would
+          # still split it and could match on the fragment after the
+          # break.
+          allow=("$CATALOG" report.md checks.md deps-stat.txt)
+          # A pipe, not a scratch file: no name on disk for anything
+          # watching $RUNNER_TEMP (a daemonized process a plugin left
+          # running from the checks above) to discover and swap the
+          # content of between this git status and the read loop opening
+          # it — an earlier mktemp version here closed the PREDICTABLE-name
+          # version of that attack, but not this one, since a temp file is
+          # still reopened by name for reading a moment after it's written
+          # (Codex, on review of the mktemp fix in mikelward/rust-update).
+          # `shopt -s lastpipe` keeps the loop below in THIS shell rather
+          # than a subshell, so $pretree set inside it survives past the
+          # pipe — verified directly (`shopt -s lastpipe; printf 'a\nb\n' |
+          # while read -r l; do out="$out$l,"; done; echo "$out"` prints
+          # "a,b,", not empty). `pipefail` still catches a genuine git
+          # status failure the same way the temp-file form's bare command
+          # did — verified directly (`shopt -s lastpipe; set -eo pipefail;
+          # false | while read l; do :; done; echo unreached` never reaches
+          # "unreached"). `if`/`fi`, not `[ ... ] &&`, records a match: a
+          # `&&` whose left side is false — every ordinary run's own
+          # allowlisted catalog/report changes, the common case — makes
+          # that whole statement, and so the loop's own exit status, and so
+          # the pipeline under pipefail, nonzero even though nothing is
+          # wrong (Codex, on review of the same construct in
+          # mikelward/rust-update: verified directly, `shopt -s lastpipe;
+          # set -eo pipefail; printf 'a\0' | while IFS= read -r -d '' e; do
+          # [ 0 -eq 1 ] && x=1; done; echo unreached` never reaches
+          # "unreached"). An `if` with no `else` always exits 0 when its
+          # condition is false.
+          pretree=""
+          git status --porcelain -z --untracked-files=all --no-renames | while IFS= read -r -d '' entry; do
+            path=${entry:3}
+            keep=1
+            for a in "${allow[@]}"; do
+              if [ "$path" = "$a" ]; then keep=0; break; fi
+            done
+            if [ "$keep" -eq 1 ]; then
+              pretree="$pretree$path"$'\n'
+            fi
+          done
+          pretree=${pretree%$'\n'}
+          plantedallow=(report.md checks.md deps-stat.txt)
+          preplanted=""
+          git status --porcelain -z --ignored --no-renames | while IFS= read -r -d '' entry; do
+            case "$entry" in
+              '!! '*) path=${entry:3} ;;
+              *) continue ;;
+            esac
+            case "$path" in
+              .gradle/*|*/.gradle/*|.kotlin/*|*/.kotlin/*|local.properties|build/*|*/build/*) continue ;;
+            esac
+            keep=1
+            for a in "${plantedallow[@]}"; do
+              if [ "$path" = "$a" ]; then keep=0; break; fi
+            done
+            if [ "$keep" -eq 1 ]; then
+              preplanted="$preplanted$path"$'\n'
+            fi
+          done
+          preplanted=${preplanted%$'\n'}
           if [ -n "$pretree" ] || [ -n "$preplanted" ]; then
             echo '::error::The checks changed the tree outside the version catalog before regeneration ran. Not opening a PR — inspect these first:'
             if [ -n "$pretree" ]; then echo "$pretree"; fi
@@ -597,6 +665,7 @@ jobs:
           REGEN_SHA: ${{ steps.regen.outputs.files_sha }}
           GIT_LITERAL_PATHSPECS: '1'
         run: |
+          shopt -s lastpipe
           set -euo pipefail
           # The restore below attributes every tracked modification to the
           # review checks — which is only true if the tree was clean (bar
@@ -618,17 +687,70 @@ jobs:
           # check that touches one fails that check, as anything else
           # would. Keyed off REGEN_SHA, so the exemption exists only when
           # the regenerate step actually ran and fingerprinted them.
-          exempt=(-e "$CATALOG" -e checks.md -e deps-stat.txt -e report.md)
+          exempt=("$CATALOG" checks.md deps-stat.txt report.md)
           if [ -n "$REGEN_SHA" ]; then
             while IFS= read -r f; do
               [ -z "$f" ] && continue
-              exempt+=(-e "$f")
+              exempt+=("$f")
             done <<< "$REGENERATED_FILES"
           fi
+          # NUL-safe and status-failure-safe the same way the regenerate
+          # step's pretree check above is, and for the same reasons — see
+          # that step's comment.
           treestate() {
-            git status --porcelain -z --untracked-files=all --no-renames \
-              | tr '\0' '\n' | sed '/^$/d' | sed 's/^...//' \
-              | grep -Fxv "${exempt[@]}" || true
+            local status_z entry path keep a out list_out
+            # $1 is required, not defaulted: every caller needs the
+            # NUL-delimited list as the source of truth for "did anything
+            # change" — the human-readable string this function also
+            # returns loses that property across the callers' own `$(...)`
+            # (command substitution strips ALL trailing newlines, so an
+            # all-newline path collapses it to empty; see the two callers'
+            # own comments).
+            list_out="$1"
+            out=""
+            # Kept NUL-delimited here too, not just newline-joined for
+            # display: capture_and_restore() below does per-file `git
+            # diff`/`reset`/`checkout`/`rm` on whatever this returns, and a
+            # review command that leaves a legitimately changed file with an
+            # embedded newline in its name would otherwise split into two
+            # fragments there, same failure mode this whole fix exists to
+            # close — just one step further downstream.
+            : > "$list_out"
+            # A pipe, not a scratch file: this step already sets
+            # `shopt -s lastpipe`, verified to also take effect for a pipe
+            # like this one nested inside a function invoked through
+            # command substitution — verified directly (`shopt -s lastpipe;
+            # f() { local out; out=""; printf 'a\0b\0' | while IFS= read -r
+            # -d '' e; do out="$out$e,"; done; printf '%s' "$out"; };
+            # x=$(f); echo "$x"` prints "a,b,").
+            #
+            # `|| return`, not a bare statement — and load-bearing on the
+            # PIPE itself, not just on treestate()'s own final line: this
+            # function's only callers are `pre=$(treestate "$pre_z")` and
+            # `changed=$(treestate "$treestate_list")`, and bash does not
+            # propagate a failure from a non-final statement inside a
+            # command substitution's function body through `set -e` on its
+            # own, whether that statement is a simple command or (still
+            # true with `pipefail`) a whole failing pipeline — verified
+            # directly both ways (`f() { false; echo after; }; x=$(f)` and
+            # `f() { false | while read l; do :; done; echo after; };
+            # x=$(f)` under `set -e` each still reach "after" and exit 0,
+            # but adding `|| return` to either failing statement stops
+            # them). An explicit `return` on failure is what makes the
+            # assignment itself see the nonzero status and trip errexit in
+            # the caller.
+            git status --porcelain -z --untracked-files=all --no-renames | while IFS= read -r -d '' entry; do
+              path=${entry:3}
+              keep=1
+              for a in "${exempt[@]}"; do
+                if [ "$path" = "$a" ]; then keep=0; break; fi
+              done
+              if [ "$keep" -eq 1 ]; then
+                out="$out$path"$'\n'
+                printf '%s\0' "$path" >> "$list_out"
+              fi
+            done || return
+            printf '%s' "${out%$'\n'}"
           }
           # review.md is NOT exempt at this gate: this step writes its
           # report outside the workspace until the loop is done, so a
@@ -642,19 +764,43 @@ jobs:
           # consumer's .gitignore matching one reclassifies the workflow's
           # own file as ignored — but review.md is NOT: nothing
           # workflow-owned has written it yet.
-          pre=$(treestate)
-          preplanted=$(git status --porcelain -z --ignored \
-            | tr '\0' '\n' | sed '/^$/d' \
-            | grep '^!! ' \
-            | sed 's/^!! //' \
-            | grep -Ev '^((.*/)?\.gradle/|(.*/)?\.kotlin/|local\.properties$|(.*/)?build/)' \
-            | grep -Fxv -e report.md -e checks.md -e deps-stat.txt || true)
-          if [ -n "$pre" ] || [ -n "$preplanted" ]; then
+          # pre_z is the source of truth for "did anything change", not
+          # $pre: command substitution strips ALL trailing newlines, not
+          # just the one the function's own `${out%$'\n'}` already trimmed,
+          # so a path made ENTIRELY of newline characters (a legal, if
+          # bizarre, Linux filename) would collapse $pre to empty even
+          # though treestate() found it — verified directly
+          # (`f() { printf '%s' "$(printf '\n\n')"; }; x=$(f); echo ${#x}`
+          # prints 0). pre_z never crosses that boundary: it is what
+          # treestate() itself wrote to disk, byte for byte.
+          pre_z=$(mktemp "$RUNNER_TEMP/gradle-update-review-pretree-list-XXXXXX.nul")
+          pre=$(treestate "$pre_z")
+          plantedallow=(report.md checks.md deps-stat.txt)
+          preplanted=""
+          git status --porcelain -z --ignored --no-renames | while IFS= read -r -d '' entry; do
+            case "$entry" in
+              '!! '*) path=${entry:3} ;;
+              *) continue ;;
+            esac
+            case "$path" in
+              .gradle/*|*/.gradle/*|.kotlin/*|*/.kotlin/*|local.properties|build/*|*/build/*) continue ;;
+            esac
+            keep=1
+            for a in "${plantedallow[@]}"; do
+              if [ "$path" = "$a" ]; then keep=0; break; fi
+            done
+            if [ "$keep" -eq 1 ]; then
+              preplanted="$preplanted$path"$'\n'
+            fi
+          done
+          preplanted=${preplanted%$'\n'}
+          if [ -s "$pre_z" ] || [ -n "$preplanted" ]; then
             echo '::error::The checks changed the tree outside the version catalog. Not opening a PR — inspect these first:'
             if [ -n "$pre" ]; then echo "$pre"; fi
             if [ -n "$preplanted" ]; then echo "$preplanted"; fi
             exit 1
           fi
+          rm -f -- "$pre_z"
           flagged=0
           # The report accumulates OUTSIDE the workspace and is copied in
           # only after the last command: review commands run in the
@@ -702,8 +848,22 @@ jobs:
           # lives outside the workspace, so even a review.md a command
           # drops is that command's own change, captured and restored.
           capture_and_restore() {
-            changed=$(treestate)
-            if [ -z "$changed" ]; then
+            # mktemp'd before calling treestate, not a fixed name — the
+            # same predictable-path/symlink concern as every other scratch
+            # file in this fix, and this one doubles as the restore loops'
+            # own input below, so a corrupted or /dev/null'd list here
+            # would mean commands the review checks ran are never restored.
+            treestate_list=$(mktemp "$RUNNER_TEMP/gradle-update-treestate-list-XXXXXX.nul")
+            changed=$(treestate "$treestate_list")
+            # -s "$treestate_list", not -z "$changed": command substitution
+            # strips ALL trailing newlines, not just the one treestate()
+            # itself trims, so a path made entirely of newline characters
+            # would collapse $changed to empty even though the list file
+            # holds a real NUL-terminated record — verified directly
+            # (`f() { printf '%s' "$(printf '\n\n')"; }; x=$(f); echo
+            # ${#x}` prints 0). The list file never crosses that boundary.
+            if [ ! -s "$treestate_list" ]; then
+              rm -f -- "$treestate_list"
               return 0
             fi
             # The heading carries the command text — check-controlled
@@ -719,7 +879,7 @@ jobs:
             else
               reported=0
             fi
-            while IFS= read -r f; do
+            while IFS= read -r -d '' f; do
               if [ "$reported" -eq 0 ] || [ "$budget" -le 0 ]; then
                 omitted=$((omitted + 1))
                 # No room in the report, but the evidence must still live
@@ -779,7 +939,7 @@ jobs:
                 cat "$RUNNER_TEMP/review-diff"
                 echo '::endgroup::'
               fi
-            done <<< "$changed"
+            done < "$treestate_list"
             if [ "$reported" -eq 1 ]; then
               echo '```' >> "$REVIEW_TMP"
             fi
@@ -787,14 +947,15 @@ jobs:
             # has nothing in HEAD to check out — restoring it means
             # unstaging it and deleting the file, where a modified or
             # deleted path restores from HEAD.
-            while IFS= read -r f; do
+            while IFS= read -r -d '' f; do
               git reset -q -- "$f"
               if git cat-file -e "HEAD:$f" 2>/dev/null; then
                 git checkout -q HEAD -- "$f"
               else
                 rm -f -- "$f"
               fi
-            done <<< "$changed"
+            done < "$treestate_list"
+            rm -f -- "$treestate_list"
           }
           # The whole loop runs fail-closed (set -e stays on): only each
           # command's own exit is caught, because a nonzero there is the
@@ -910,6 +1071,7 @@ jobs:
           REGEN_SHA: ${{ steps.regen.outputs.files_sha }}
           REGEN_MODE: ${{ steps.regen.outputs.files_mode }}
         run: |
+          shopt -s lastpipe
           set -euo pipefail
           # `git status`, not `git diff`: diff only sees tracked changes, so
           # an untracked file dropped into the tree by a plugin would sail
@@ -921,7 +1083,7 @@ jobs:
           # `-z` so git emits paths raw: its C-quoting of spaces and
           # non-ASCII would otherwise never equal the literal $CATALOG and
           # fail every publication under such a path.
-          allow=(-e "$CATALOG" -e checks.md -e deps-stat.txt -e report.md)
+          allow=("$CATALOG" checks.md deps-stat.txt report.md)
           # Regenerated files are the batch's own product when the
           # regenerate step ran — expected to differ, vouched for by the
           # fingerprint check below rather than by this allowlist.
@@ -930,7 +1092,7 @@ jobs:
             while IFS= read -r f; do
               [ -z "$f" ] && continue
               derived+=("$f")
-              allow+=(-e "$f")
+              allow+=("$f")
             done <<< "$REGENERATED_FILES"
           fi
           # review.md is workflow-owned only when review checks ran (that
@@ -938,11 +1100,22 @@ jobs:
           # checks disabled nothing here writes it, so one appearing now is
           # a check's doing — exempting it would ship that content into the
           # PR body's Review section.
-          if [ -n "$REVIEW_CHECKS" ]; then allow+=(-e review.md); fi
-          unexpected=$(git status --porcelain -z --untracked-files=all \
-            | tr '\0' '\n' | sed '/^$/d' \
-            | sed 's/^...//' \
-            | grep -Fxv "${allow[@]}" || true)
+          if [ -n "$REVIEW_CHECKS" ]; then allow+=(review.md); fi
+          # Pipe, not a scratch file, and NUL-safe/status-failure-safe the
+          # same way the regenerate step's pretree check is — see that
+          # step's comment.
+          unexpected=""
+          git status --porcelain -z --untracked-files=all --no-renames | while IFS= read -r -d '' entry; do
+            path=${entry:3}
+            keep=1
+            for a in "${allow[@]}"; do
+              if [ "$path" = "$a" ]; then keep=0; break; fi
+            done
+            if [ "$keep" -eq 1 ]; then
+              unexpected="$unexpected$path"$'\n'
+            fi
+          done
+          unexpected=${unexpected%$'\n'}
           if [ -n "$unexpected" ]; then
             echo '::error::The batch touched files outside the version catalog. Not opening a PR — inspect these first:'
             echo "$unexpected"
@@ -963,14 +1136,26 @@ jobs:
           # review.md a check dropped must still stop the run, or it would
           # ride the artifact into the PR body through the one pass that
           # no longer sees it.
-          plantedallow=(-e report.md -e checks.md -e deps-stat.txt)
-          if [ -n "$REVIEW_CHECKS" ]; then plantedallow+=(-e review.md); fi
-          planted=$(git status --porcelain -z --ignored \
-            | tr '\0' '\n' | sed '/^$/d' \
-            | grep '^!! ' \
-            | sed 's/^!! //' \
-            | grep -Ev '^((.*/)?\.gradle/|(.*/)?\.kotlin/|local\.properties$|(.*/)?build/)' \
-            | grep -Fxv "${plantedallow[@]}" || true)
+          plantedallow=(report.md checks.md deps-stat.txt)
+          if [ -n "$REVIEW_CHECKS" ]; then plantedallow+=(review.md); fi
+          planted=""
+          git status --porcelain -z --ignored --no-renames | while IFS= read -r -d '' entry; do
+            case "$entry" in
+              '!! '*) path=${entry:3} ;;
+              *) continue ;;
+            esac
+            case "$path" in
+              .gradle/*|*/.gradle/*|.kotlin/*|*/.kotlin/*|local.properties|build/*|*/build/*) continue ;;
+            esac
+            keep=1
+            for a in "${plantedallow[@]}"; do
+              if [ "$path" = "$a" ]; then keep=0; break; fi
+            done
+            if [ "$keep" -eq 1 ]; then
+              planted="$planted$path"$'\n'
+            fi
+          done
+          planted=${planted%$'\n'}
           if [ -n "$planted" ]; then
             echo '::error::The batch left unexpected IGNORED files in the tree. Not opening a PR — inspect these first:'
             echo "$planted"
