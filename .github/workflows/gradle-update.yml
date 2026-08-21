@@ -157,8 +157,8 @@ jobs:
       contents: read
     outputs:
       changed: ${{ steps.changed.outputs.changed }}
-      passed: ${{ steps.checks.outputs.passed }}
-      review_flagged: ${{ steps.review.outputs.flagged }}
+      checks_sha: ${{ steps.checks.outputs.checks_sha }}
+      review_verdicts: ${{ steps.review.outputs.verdicts }}
       regen_sha: ${{ steps.regen.outputs.files_sha }}
       regen_hash: ${{ steps.regen.outputs.files_hash }}
       regen_mode: ${{ steps.regen.outputs.files_mode }}
@@ -332,7 +332,7 @@ jobs:
             # checks.md or where the next check runs. The runner command
             # files are pointed at /dev/null inside it: they are the channel
             # a planted process would use to forge THIS step's own outputs
-            # (a "passed=true" written into $GITHUB_OUTPUT from inside a
+            # (a fingerprint written into $GITHUB_OUTPUT from inside a
             # check). Code running as this user can still hunt the real
             # files down on disk — same-machine isolation is not claimed,
             # and the design already reads check results as evidence, not
@@ -356,11 +356,22 @@ jobs:
           # missing verdict decide the title and the arming.
           set -e
           cat checks.md >> "$GITHUB_STEP_SUMMARY"
-          if [ $failed -eq 0 ]; then
-            echo 'passed=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'passed=false' >> "$GITHUB_OUTPUT"
-          fi
+          # checks.md just got its real, final content — fingerprint it
+          # now, the same way catalog_sha was captured before any
+          # dependency code ran. The checks above ran dependency code in
+          # THIS job; a build script's background process could still be
+          # alive and rewrite the file on disk before upload-artifact reads
+          # it. A step OUTPUT is out of that process's reach (it lives in
+          # the runner's control plane, not the filesystem), and publish —
+          # a fresh runner that executes no dependency code — verifies the
+          # downloaded copy against it.
+          echo "checks_sha=$(sha256sum -- checks.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          # No pass/fail boolean written as this step's own output —
+          # publish derives that itself, from checks.md's own (fingerprint-
+          # verified) content, rather than trusting a second, independently-
+          # forgeable value from this same untrusted step. The sibling
+          # npm-update closed this exact gap first; see its AGENTS.md
+          # "Trust model". rust-update carries the same fix.
           # Gradle build scripts and plugins ran above and $GITHUB_PATH /
           # $GITHUB_ENV apply to LATER steps, so a planted binary could
           # otherwise shadow `git` and `sha256sum` for the verification
@@ -801,7 +812,6 @@ jobs:
             exit 1
           fi
           rm -f -- "$pre_z"
-          flagged=0
           # The report accumulates OUTSIDE the workspace and is copied in
           # only after the last command: review commands run in the
           # workspace, so one that cleans untracked files (`git clean`,
@@ -811,6 +821,11 @@ jobs:
           # like any other file.
           REVIEW_TMP="$RUNNER_TEMP/review.md"
           : > "$REVIEW_TMP"
+          # The verdict record: one canonical line per review command,
+          # never capped — the flag publish derives must not depend on
+          # what the budget-capped report had room to print.
+          : > "$RUNNER_TEMP/review-verdicts"
+          omittedcmds=0
           # Two caps: 20,000 bytes per file AND a whole-report budget,
           # because the PR body has a hard 65,536-character limit and a
           # body that exceeds it fails to publish at all — which would
@@ -834,7 +849,6 @@ jobs:
           if [ "$budget" -gt 40000 ]; then budget=40000; fi
           if [ "$budget" -lt 0 ]; then budget=0; fi
           omitted=0
-          omittedcmds=0
           # Capture $1's tree changes into review.md, then restore them —
           # ONE COMMAND AT A TIME, so every command starts from the tree
           # the ordinary checks left and a later command can neither
@@ -977,14 +991,17 @@ jobs:
             echo '::endgroup::'
             # The verdict line carries the command text too, so it is
             # charged the same way; a line past the cap folds into the
-            # closing notice. The FLAG itself is never capped — flagged,
-            # the title, and the unarmed auto-merge are computed from rc,
-            # not from what the report had room to print.
+            # closing notice — an UNconditional write here would let a
+            # long configured command list grow the body past GitHub's
+            # 65,536-character limit and fail the body edit outright,
+            # hiding every report at once (Codex review). The FLAG itself
+            # never depends on what the report had room to print: every
+            # verdict line also lands in the uncapped verdict record
+            # below, which crosses to publish as a step output.
             if [ "$rc" -eq 0 ]; then
               line="- ✅ \`$cmd\`"
             else
               line="- 🚩 \`$cmd\` (exit $rc) — human review requested"
-              flagged=1
             fi
             budget=$((budget - $(printf '%s\n' "$line" | wc -c)))
             if [ "$budget" -ge 0 ]; then
@@ -992,6 +1009,7 @@ jobs:
             else
               omittedcmds=$((omittedcmds + 1))
             fi
+            printf '%s\n' "$line" >> "$RUNNER_TEMP/review-verdicts"
             # A flagging command's own output is the REASON a human is
             # being asked to look, but it is NOT safe to copy here: this
             # command ran in the same untrusted window as `regenerate`, and
@@ -1044,11 +1062,24 @@ jobs:
           # command has run and been restored.
           cp -- "$REVIEW_TMP" review.md
           cat review.md >> "$GITHUB_STEP_SUMMARY"
-          if [ $flagged -eq 0 ]; then
-            echo 'flagged=false' >> "$GITHUB_OUTPUT"
-          else
-            echo 'flagged=true' >> "$GITHUB_OUTPUT"
-          fi
+          # The verdict record crosses to publish as a step output — the
+          # control-plane channel the fingerprints already ride, out of
+          # reach of a background process rewriting files before
+          # upload-artifact reads them — and publish derives the review
+          # flag from IT, never from a boolean this untrusted step
+          # reported about its own run and never from review.md, whose
+          # verdict lines the body budget may legitimately have capped.
+          # review.md itself is informational from here on, like
+          # report.md and deps-stat.txt. The delimiter follows the
+          # REGEN_SHA_EOF convention above; a configured review command
+          # that is literally this delimiter line would corrupt its own
+          # record, and the count mismatch in publish then flags the
+          # batch rather than passing it.
+          {
+            echo 'verdicts<<REVIEW_VERDICTS_EOF'
+            cat -- "$RUNNER_TEMP/review-verdicts"
+            echo 'REVIEW_VERDICTS_EOF'
+          } >> "$GITHUB_OUTPUT"
           # Same reasoning as the checks step: review checks ran dependency
           # code, so discard anything they queued for later steps.
           : > "$GITHUB_PATH"
@@ -1339,6 +1370,7 @@ jobs:
           # would otherwise become code under this job's write token. As env
           # it is data, and a forged value is bounded to a failed comparison.
           CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
+          CHECKS_SHA: ${{ needs.update.outputs.checks_sha }}
           REGENERATED_FILES: ${{ inputs.regenerated-files }}
           REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
           REGEN_MODE: ${{ needs.update.outputs.regen_mode }}
@@ -1347,6 +1379,15 @@ jobs:
         run: |
           set -euo pipefail
           mv -- .dependency-update/checks.md .dependency-update/review.md .dependency-update/deps-stat.txt .dependency-update/report.md .
+          # checks.md gates the PR title and auto-merge (the verdict step
+          # below derives the check verdict from its content), so it gets
+          # the same artifact-vs-control-plane check as the catalog.
+          # deps-stat.txt, report.md, and review.md stay unverified on
+          # purpose: purely informational, they gate nothing — the review
+          # FLAG crosses as the review step's verdict-record output, a
+          # control-plane value that needs no artifact verification.
+          [ "$(sha256sum -- checks.md | cut -d' ' -f1)" = "$CHECKS_SHA" ] \
+            || { echo '::error::checks.md does not match what the update job recorded.'; exit 1; }
           # The regenerated files, before the catalog so the catalog still
           # moves last. The tar was written on the machine that ran
           # dependency code, so nothing in it is trusted by name: it is
@@ -1487,8 +1528,156 @@ jobs:
       # point is a real seam: this half decides the branch name and either
       # adopts an existing one or commits and pushes a new one; the next
       # half only opens/updates the PR. What crosses the boundary — branch,
+      # The update job used to report `passed` and `flagged` booleans about
+      # its own checks — produced inside the same untrusted steps that ran
+      # dependency code, so a compromised build script's background process
+      # could append `passed=true` (or `flagged=false`) to the step's real
+      # $GITHUB_OUTPUT after the honest write (later duplicate keys win;
+      # the runner captures the file only at step end) and the PR would
+      # title itself clean, and arm auto-merge, while checks.md showed ❌
+      # lines in the same body. Deriving both verdicts HERE, from the
+      # fingerprint-verified files themselves, collapses each pair of
+      # independently-forgeable signals to one: the file this job just
+      # checked. Not a complete fix — a forger who fakes a file
+      # consistently with its own fingerprint inside the step's window
+      # still isn't caught — but it matches the posture the sibling
+      # npm-update took first and rust-update carries too.
+      #
+      # The check verdict fails closed: a line that doesn't match the exact
+      # format the checks step writes, a check identity the consumer didn't
+      # configure, or a configured check recorded a different number of
+      # times than it was configured are all treated as failed, never
+      # silently passed. The configured lists are trusted ground truth —
+      # they come from the consumer's own workflow file via workflow_call,
+      # not from anything the update runner produced.
+      #
+      # The review flag fails closed toward FLAGGED (the direction that
+      # holds auto-merge and asks a human), and derives from the review
+      # step's VERDICT RECORD output — one canonical line per configured
+      # command, never budget-capped, carrying no diff content — rather
+      # than from review.md, whose verdict lines the body budget may
+      # legitimately have capped and whose captured diffs could resemble
+      # verdict lines. Every record line must exactly match a configured
+      # rendering the configured number of times; any 🚩, unknown line, or
+      # count mismatch flags.
+      - name: Derive the verdicts from the recorded evidence, not the untrusted job's own report
+        id: verdict
+        env:
+          CHECKS: ${{ inputs.checks }}
+          REVIEW_CHECKS: ${{ inputs.review-checks }}
+          REVIEW_VERDICTS: ${{ needs.update.outputs.review_verdicts }}
+        run: |
+          set -euo pipefail
+          declare -A expected_count recorded_count
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            expected_count["$cmd"]=$(( ${expected_count["$cmd"]:-0} + 1 ))
+          done <<< "$CHECKS"
+          failed=0
+          # `|| [ -n "$line" ]` picks up a final line with no trailing
+          # newline — checks.md as the update job writes it always ends in
+          # one, but a forged or truncated file might not, and a plain
+          # `while read` would silently drop (and never validate) that
+          # last line.
+          #
+          # Each line is matched against the EXPECTED renderings built
+          # from the trusted config — never parsed generically out of its
+          # backtick delimiters. A configured command may itself contain
+          # backticks (`echo \`date\``, legal shell), which the writer
+          # embeds verbatim; a delimiter-parsing regex would refuse that
+          # line and fail a batch whose check genuinely passed (Codex
+          # review, on the rust-update twin). Fixed-string comparison per
+          # configured command has no such blind spot, and an unmatched
+          # line still fails closed.
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            matched=''
+            for cmd in "${!expected_count[@]}"; do
+              if [ "$line" = "- ✅ \`$cmd\`" ]; then
+                matched=$cmd
+                is_failed=0
+                break
+              fi
+              prefix="- ❌ \`$cmd\` (exit "
+              rest=${line#"$prefix"}
+              if [ "$rest" != "$line" ] && [[ "$rest" =~ ^[0-9]+\)$ ]]; then
+                matched=$cmd
+                is_failed=1
+                break
+              fi
+            done
+            if [ -z "$matched" ]; then
+              echo "::error::checks.md has a line that records no configured check in the canonical format — treating as failed rather than guessing: $line"
+              echo 'passed=false' >> "$GITHUB_OUTPUT"
+              echo 'flagged=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            recorded_count["$matched"]=$(( ${recorded_count["$matched"]:-0} + 1 ))
+            [ "$is_failed" -eq 1 ] && failed=1
+          done < checks.md
+          for cmd in "${!expected_count[@]}"; do
+            if [ "${recorded_count[$cmd]:-0}" -ne "${expected_count[$cmd]}" ]; then
+              echo "::error::checks.md records '$cmd' ${recorded_count[$cmd]:-0} time(s), expected ${expected_count[$cmd]} — treating as failed rather than guessing."
+              echo 'passed=false' >> "$GITHUB_OUTPUT"
+              echo 'flagged=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          if [ "$failed" -eq 1 ]; then
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'passed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+          # The review flag, from the verdict record — pure canonical
+          # lines, so unknown lines are refused the same way checks.md's
+          # are. Only the EXACT configured renderings count, never a bare
+          # '^- 🚩 ' prefix scan or a delimiter-parsing regex (Codex
+          # review, twice over): the record carries no diff content to
+          # false-flag on, and matching against the trusted config keeps a
+          # configured command's own backticks inert.
+          flagged=false
+          if [ -n "$REVIEW_CHECKS" ]; then
+            declare -A review_expected review_recorded
+            while IFS= read -r cmd; do
+              [ -z "$cmd" ] && continue
+              review_expected["$cmd"]=$(( ${review_expected["$cmd"]:-0} + 1 ))
+            done <<< "$REVIEW_CHECKS"
+            flag_suffix_re='^[0-9]+\) — human review requested$'
+            while IFS= read -r line || [ -n "$line" ]; do
+              [ -z "$line" ] && continue
+              vmatched=''
+              for cmd in "${!review_expected[@]}"; do
+                if [ "$line" = "- ✅ \`$cmd\`" ]; then
+                  vmatched=$cmd
+                  break
+                fi
+                prefix="- 🚩 \`$cmd\` (exit "
+                rest=${line#"$prefix"}
+                if [ "$rest" != "$line" ] && [[ "$rest" =~ $flag_suffix_re ]]; then
+                  vmatched=$cmd
+                  flagged=true
+                  break
+                fi
+              done
+              if [ -z "$vmatched" ]; then
+                echo "::error::the review verdict record has a line that records no configured review check — flagging for human review rather than guessing: $line"
+                flagged=true
+              else
+                review_recorded["$vmatched"]=$(( ${review_recorded["$vmatched"]:-0} + 1 ))
+              fi
+            done <<< "$REVIEW_VERDICTS"
+            for cmd in "${!review_expected[@]}"; do
+              if [ "${review_recorded[$cmd]:-0}" -ne "${review_expected[$cmd]}" ]; then
+                echo "::error::the review verdict record has '$cmd' ${review_recorded[$cmd]:-0} time(s), expected ${review_expected[$cmd]} — flagging for human review rather than guessing."
+                flagged=true
+              fi
+            done
+          fi
+          echo "flagged=$flagged" >> "$GITHUB_OUTPUT"
+
       # title, verdict, validated_head — travels as step outputs, the same
-      # channel `passed` already rides.
+      # channel the fingerprints already ride.
       - name: Resolve the branch, then adopt or commit and push
         id: resolve
         env:
@@ -1508,9 +1697,12 @@ jobs:
           # never change what this write-enabled job executes.
           COMMIT_PREFIX: ${{ inputs.commit-prefix }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          # Env, not inline — see the fingerprint step.
-          PASSED: ${{ needs.update.outputs.passed }}
-          REVIEW_FLAGGED: ${{ needs.update.outputs.review_flagged }}
+          # From THIS job's own "Derive the verdicts" step — computed from
+          # fingerprint-verified checks.md and review.md — never the
+          # untrusted update job's own report of itself. Env, not inline —
+          # see the fingerprint step.
+          PASSED: ${{ steps.verdict.outputs.passed }}
+          REVIEW_FLAGGED: ${{ steps.verdict.outputs.flagged }}
           CATALOG_SHA: ${{ needs.update.outputs.catalog_sha }}
           REGENERATED_FILES: ${{ inputs.regenerated-files }}
           REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
@@ -1801,8 +1993,8 @@ jobs:
           # two permissions (Contents + pull requests) cover.
           DEFAULT_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          PASSED: ${{ needs.update.outputs.passed }}
-          REVIEW_FLAGGED: ${{ needs.update.outputs.review_flagged }}
+          PASSED: ${{ steps.verdict.outputs.passed }}
+          REVIEW_FLAGGED: ${{ steps.verdict.outputs.flagged }}
           RESOLVED_BRANCH: ${{ steps.resolve.outputs.branch }}
           RESOLVED_TITLE: ${{ steps.resolve.outputs.title }}
           RESOLVED_VERDICT: ${{ steps.resolve.outputs.verdict }}

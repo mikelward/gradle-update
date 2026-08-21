@@ -568,3 +568,212 @@ test("a staged rename onto an allowlisted destination doesn't hide the source pa
     rmSync(runnerTemp, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// The three command loops and the publish-side verdict derivation. The
+// update job runs unreviewed dependency code, so publish must never read a
+// pass/fail or review-flag boolean that job reported about itself — it
+// derives both from checks.md and review.md, whose bytes it first verified
+// against fingerprints captured in the runner's control plane. Ported from
+// the identical fix in mikelward/npm-update (see its AGENTS.md "Trust
+// model"); rust-update carries the same pair of fixes.
+// ---------------------------------------------------------------------------
+
+test("the update job exports no verdict booleans; publish wires both from its own derivation", () => {
+  assert.doesNotMatch(workflow, /passed: \$\{\{ steps\.checks\.outputs\.passed \}\}/);
+  assert.doesNotMatch(workflow, /review_flagged: \$\{\{ steps\.review\.outputs\.flagged \}\}/);
+  assert.doesNotMatch(workflow, /needs\.update\.outputs\.passed/);
+  assert.doesNotMatch(workflow, /needs\.update\.outputs\.review_flagged/);
+  assert.match(workflow, /checks_sha: \$\{\{ steps\.checks\.outputs\.checks_sha \}\}/);
+  assert.match(workflow, /review_verdicts: \$\{\{ steps\.review\.outputs\.verdicts \}\}/);
+  assert.match(workflow, /checks_sha=\$\(sha256sum -- checks\.md \| cut -d' ' -f1\)/);
+  assert.match(workflow, /CHECKS_SHA: \$\{\{ needs\.update\.outputs\.checks_sha \}\}/);
+  assert.match(workflow, /REVIEW_VERDICTS: \$\{\{ needs\.update\.outputs\.review_verdicts \}\}/);
+  assert.match(
+    workflow,
+    /\[ "\$\(sha256sum -- checks\.md \| cut -d' ' -f1\)" = "\$CHECKS_SHA" \]/,
+    "publish no longer verifies checks.md against the update job's fingerprint",
+  );
+  const passedWires = [...workflow.matchAll(/PASSED: \$\{\{ steps\.verdict\.outputs\.passed \}\}/g)];
+  const flaggedWires = [...workflow.matchAll(/REVIEW_FLAGGED: \$\{\{ steps\.verdict\.outputs\.flagged \}\}/g)];
+  assert.equal(passedWires.length, 2, "both consumer steps must read PASSED from the verdict step");
+  assert.equal(flaggedWires.length, 2, "both consumer steps must read REVIEW_FLAGGED from the verdict step");
+});
+
+test("verdict lines ride the uncapped verdict-record output; review.md's copies stay budget-capped", () => {
+  // Two constraints in tension, both real: the flag publish derives must
+  // not depend on what the budget-capped report had room to print (a 🚩
+  // capped out of review.md would read back as "nothing flagged"), and an
+  // UNconditional review.md write would let a long configured command
+  // list grow the PR body past GitHub's 65,536-character limit, failing
+  // the body edit and hiding every report at once (Codex review, one
+  // round each). So the verdict line is written to review.md only within
+  // budget (omittedcmds folds the rest into the closing notice), while
+  // EVERY verdict line lands in $RUNNER_TEMP/review-verdicts, which
+  // crosses to publish as a step output — the control-plane channel the
+  // fingerprints ride.
+  const start = workflow.indexOf('line="- 🚩 \\`$cmd\\` (exit $rc) — human review requested"');
+  assert.notEqual(start, -1, "the review verdict-line writer was not found");
+  const tail = workflow.slice(start, start + 800);
+  assert.match(tail, /if \[ "\$budget" -ge 0 \]; then\n\s*printf '%s\\n' "\$line" >> "\$REVIEW_TMP"\n\s*else\n\s*omittedcmds=\$\(\(omittedcmds \+ 1\)\)/);
+  assert.match(tail, /printf '%s\\n' "\$line" >> "\$RUNNER_TEMP\/review-verdicts"/);
+  assert.match(workflow, /verdicts<<REVIEW_VERDICTS_EOF/, "the verdict record must cross as a heredoc step output");
+  assert.doesNotMatch(workflow, /review_sha/, "the review.md fingerprint is gone — the flag derives from the verdict-record output instead");
+});
+
+function extractVerdictBlock(text) {
+  const startMarker = "declare -A expected_count recorded_count";
+  const start = text.indexOf(startMarker);
+  assert.notEqual(start, -1, "verdict block start marker not found in gradle-update.yml");
+  const endMarker = 'echo "flagged=$flagged" >> "$GITHUB_OUTPUT"';
+  const end = text.indexOf(endMarker, start);
+  assert.notEqual(end, -1, "verdict block end marker not found");
+  const raw = text.slice(start, end + endMarker.length);
+  return raw.replace(/^ {10}/gm, "");
+}
+
+function runVerdictBlock({ checks, reviewChecks, checksMd, reviewVerdicts }) {
+  const dir = mkdtempSync(join(tmpdir(), "gradle-update-verdict-"));
+  try {
+    writeFileSync(join(dir, "checks.md"), checksMd);
+    const outputFile = join(dir, "github_output");
+    writeFileSync(outputFile, "");
+    const script = `cd "$1"\nset -euo pipefail\n${extractVerdictBlock(workflow)}\n`;
+    execFileSync("bash", ["-c", script, "bash", dir], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CHECKS: checks,
+        REVIEW_CHECKS: reviewChecks ?? "",
+        REVIEW_VERDICTS: reviewVerdicts ?? "",
+        GITHUB_OUTPUT: outputFile,
+      },
+    });
+    return readFileSync(outputFile, "utf8");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("a configured check containing backticks still round-trips through the verdict", () => {
+  // Codex review on the rust-update twin: a derivation that parses the
+  // command back out of its backtick delimiters with [^`]+ refuses a
+  // configured check that itself contains backticks (echo `date`, legal
+  // shell) — failing a batch whose check genuinely passed. Lines are
+  // matched against the expected renderings built from the trusted
+  // config instead, which has no delimiter blind spot.
+  const checks = "echo `date`";
+  assert.match(
+    runVerdictBlock({ checks, reviewChecks: "", checksMd: "- ✅ `echo `date``\n" }),
+    /passed=true/,
+  );
+  assert.match(
+    runVerdictBlock({ checks, reviewChecks: "", checksMd: "- ❌ `echo `date`` (exit 1)\n" }),
+    /passed=false/,
+  );
+});
+
+test("the derived verdicts pass a matching all-green checks.md and review.md", () => {
+  const checks = "./gradlew test\n./gradlew lint";
+  const green = "- ✅ `./gradlew test`\n- ✅ `./gradlew lint`\n";
+  const out = runVerdictBlock({
+    checks,
+    reviewChecks: "./gradlew licensee",
+    checksMd: green,
+    reviewVerdicts: "- ✅ `./gradlew licensee`\n",
+  });
+  assert.match(out, /passed=true/);
+  assert.match(out, /flagged=false/);
+
+  // The record is one canonical line per configured command — review.md's
+  // free-form diff content never reaches the derivation at all.
+
+  // No review checks configured: no flag, whatever review.md holds.
+  const noReview = runVerdictBlock({ checks, reviewChecks: "", checksMd: green });
+  assert.match(noReview, /passed=true/);
+  assert.match(noReview, /flagged=false/);
+});
+
+test("the derived check verdict fails closed on every malformed, mismatched, or failing checks.md", () => {
+  const checks = "./gradlew test\n./gradlew lint";
+  const cases = [
+    ["- ✅ `./gradlew test`\n- ❌ `./gradlew lint` (exit 1)\n", "a ❌ line"],
+    ["", "an empty checks.md"],
+    ["- ✅ `./gradlew test`\n", "a missing check record"],
+    ["- ✅ `./gradlew test`\n- ✅ `./gradlew test`\n", "a duplicated record standing in for a missing one"],
+    ["- ✅ `./gradlew test`\n- ✅ `./gradlew lint`\n- ✅ `true`\n", "an unconfigured check"],
+    ["- ✅ `./gradlew test`\n- ✅ `./gradlew lint`\nAll checks passed!\n", "a non-canonical line"],
+  ];
+  for (const [content, label] of cases) {
+    const out = runVerdictBlock({ checks, reviewChecks: "", checksMd: content });
+    assert.match(out, /passed=false/, `${label} did not fail closed`);
+  }
+});
+
+test("the derived review flag flags on a 🚩 line and fails closed toward flagged on a mismatched report", () => {
+  const checks = "./gradlew test";
+  const green = "- ✅ `./gradlew test`\n";
+  const flaggedOut = runVerdictBlock({
+    checks,
+    reviewChecks: "./gradlew licensee",
+    checksMd: green,
+    reviewVerdicts: "- 🚩 `./gradlew licensee` (exit 1) — human review requested\n",
+  });
+  assert.match(flaggedOut, /passed=true/);
+  assert.match(flaggedOut, /flagged=true/);
+
+  // A configured review command with no verdict line at all: a malformed
+  // or forged report, and the safe reading is flagged.
+  const missing = runVerdictBlock({
+    checks,
+    reviewChecks: "./gradlew licensee",
+    checksMd: green,
+    reviewVerdicts: "",
+  });
+  assert.match(missing, /flagged=true/);
+
+  // The checks.md early-exit paths force the flag too — a report publish
+  // could not validate must hold auto-merge, not arm it.
+  const malformed = runVerdictBlock({
+    checks,
+    reviewChecks: "./gradlew licensee",
+    checksMd: "garbage\n",
+    reviewVerdicts: "- ✅ `./gradlew licensee`\n",
+  });
+  assert.match(malformed, /passed=false/);
+  assert.match(malformed, /flagged=true/);
+});
+
+test("the verdict record fails closed on unknown lines and count mismatches", () => {
+  // The record carries only canonical verdict lines (never diff content —
+  // that stays in review.md, which the derivation no longer reads), so an
+  // unknown line is refused outright, and a configured command recorded a
+  // different number of times than configured flags — both toward
+  // FLAGGED, the safe reading.
+  const checks = "./gradlew test";
+  const green = "- ✅ `./gradlew test`\n";
+  const unknown = runVerdictBlock({
+    checks,
+    reviewChecks: "./gradlew licensee",
+    checksMd: green,
+    reviewVerdicts: "- ✅ `./gradlew licensee`\nnot a verdict line\n",
+  });
+  assert.match(unknown, /flagged=true/);
+
+  const duplicated = runVerdictBlock({
+    checks,
+    reviewChecks: "./gradlew licensee",
+    checksMd: green,
+    reviewVerdicts: "- ✅ `./gradlew licensee`\n- ✅ `./gradlew licensee`\n",
+  });
+  assert.match(duplicated, /flagged=true/);
+
+  // A doubled configured command legitimately records twice.
+  const doubled = runVerdictBlock({
+    checks,
+    reviewChecks: "./gradlew licensee\n./gradlew licensee",
+    checksMd: green,
+    reviewVerdicts: "- ✅ `./gradlew licensee`\n- ✅ `./gradlew licensee`\n",
+  });
+  assert.match(doubled, /flagged=false/);
+});
