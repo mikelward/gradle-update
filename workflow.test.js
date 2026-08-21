@@ -579,6 +579,54 @@ test("a staged rename onto an allowlisted destination doesn't hide the source pa
 // model"); rust-update carries the same pair of fixes.
 // ---------------------------------------------------------------------------
 
+test("every eval'd command loop redirects stdin away from its own herestring", () => {
+  // The loops feed themselves through herestrings, and each eval'd command
+  // used to inherit that herestring as its own stdin — so a command that
+  // reads stdin (./gradlew's daemon client forwards and drains it) DRAINED
+  // the remaining commands: the loop ended early, unrun checks never
+  // reported (a false pass), unrun regenerate commands left stale derived
+  // files committed, and a dropped flagging review command left auto-merge
+  // armed. Three loops, three redirects.
+  const redirected = [...workflow.matchAll(/eval "\$cmd" \) < \/dev\/null/g)];
+  assert.equal(redirected.length, 3, `expected all 3 eval loops to redirect stdin, found ${redirected.length}`);
+});
+
+function extractChecksLoopBlock(text) {
+  const startMarker = ": > checks.md";
+  const start = text.indexOf(startMarker);
+  assert.notEqual(start, -1, "checks-loop block start marker not found in gradle-update.yml");
+  const endMarker = 'done <<< "$CHECKS"';
+  const end = text.indexOf(endMarker, start);
+  assert.notEqual(end, -1, "checks-loop block end marker not found");
+  const raw = text.slice(start, end + endMarker.length);
+  return raw.replace(/^ {10}/gm, "");
+}
+
+test("a check that drains stdin cannot swallow the commands after it", () => {
+  // Verified against the exact loop structure before fixing: with the
+  // redirect absent, this case records one ✅ line and ends with failed=0.
+  const dir = mkdtempSync(join(tmpdir(), "gradle-update-checksloop-"));
+  try {
+    const script = [
+      'cd "$1"',
+      "CHECKS=$'cat > /dev/null\\nfalse'",
+      "failed=0",
+      extractChecksLoopBlock(workflow),
+      'echo "failed=$failed"',
+    ].join("\n");
+    const out = execFileSync("bash", ["-c", script, "bash", dir], { encoding: "utf8" });
+    const checksMd = readFileSync(join(dir, "checks.md"), "utf8");
+    assert.equal(
+      checksMd,
+      "- ✅ `cat > /dev/null`\n- ❌ `false` (exit 1)\n",
+      "the stdin-draining first check swallowed the second — it never ran or never reported",
+    );
+    assert.match(out, /failed=1/, "the failing second check did not set failed=1");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the update job exports no verdict booleans; publish wires both from its own derivation", () => {
   assert.doesNotMatch(workflow, /passed: \$\{\{ steps\.checks\.outputs\.passed \}\}/);
   assert.doesNotMatch(workflow, /review_flagged: \$\{\{ steps\.review\.outputs\.flagged \}\}/);
