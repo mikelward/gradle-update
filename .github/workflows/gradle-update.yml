@@ -337,10 +337,17 @@ jobs:
             # files down on disk — same-machine isolation is not claimed,
             # and the design already reads check results as evidence, not
             # proof — but the casual channel costs one line to close.
+            # Stdin redirected too: the loop's own herestring IS the
+            # subshell's inherited stdin, so a check that reads stdin
+            # (./gradlew's daemon client forwards and drains it; so does
+            # anything piping through cat) would otherwise DRAIN the
+            # remaining commands — the loop ends early and every unrun
+            # check silently never reports, a false pass shaped exactly
+            # like the ones this file exists to refuse.
             ( export GITHUB_OUTPUT=/dev/null GITHUB_ENV=/dev/null \
                 GITHUB_PATH=/dev/null GITHUB_STEP_SUMMARY=/dev/null \
                 GITHUB_STATE=/dev/null
-              eval "$cmd" )
+              eval "$cmd" ) < /dev/null
             rc=$?
             echo '::endgroup::'
             if [ $rc -eq 0 ]; then
@@ -580,9 +587,12 @@ jobs:
           # these three names unconditionally, so a regeneration-authored
           # report would publish as the workflow's own.
           reports_sha_before=$(sha256sum report.md checks.md deps-stat.txt)
-          # Same containment as the checks. A failure is a STOP, not a
-          # flag: a batch whose derived files could not be rebuilt would
-          # publish stale ones, which is the silent drift this step
+          # Same containment as the checks, stdin redirect included — a
+          # regenerate command that reads stdin would otherwise drain the
+          # herestring feeding this loop and silently skip the commands
+          # after it, committing stale derived files. A failure is a STOP,
+          # not a flag: a batch whose derived files could not be rebuilt
+          # would publish stale ones, which is the silent drift this step
           # exists to end.
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
@@ -590,7 +600,7 @@ jobs:
             ( export GITHUB_OUTPUT=/dev/null GITHUB_ENV=/dev/null \
                 GITHUB_PATH=/dev/null GITHUB_STEP_SUMMARY=/dev/null \
                 GITHUB_STATE=/dev/null
-              eval "$cmd" )
+              eval "$cmd" ) < /dev/null
             echo '::endgroup::'
           done <<< "$REGENERATE"
           if [ "$(sha256sum report.md checks.md deps-stat.txt)" != "$reports_sha_before" ]; then
@@ -983,10 +993,15 @@ jobs:
             # command's own words can go into the report below; the log
             # still gets every byte, and a command that cleans the
             # workspace cannot delete this.
+            # Stdin from /dev/null for the same reason as the other two
+            # command loops: the herestring feeding this loop is otherwise
+            # the subshell's stdin, and a command that reads it would
+            # silently drain the review checks after it — a dropped
+            # flagging command leaves auto-merge armed.
             ( export GITHUB_OUTPUT=/dev/null GITHUB_ENV=/dev/null \
                 GITHUB_PATH=/dev/null GITHUB_STEP_SUMMARY=/dev/null \
                 GITHUB_STATE=/dev/null
-              eval "$cmd" ) > "$RUNNER_TEMP/review-out" 2>&1 || rc=$?
+              eval "$cmd" ) < /dev/null > "$RUNNER_TEMP/review-out" 2>&1 || rc=$?
             cat -- "$RUNNER_TEMP/review-out"
             echo '::endgroup::'
             # The verdict line carries the command text too, so it is
