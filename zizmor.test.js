@@ -90,6 +90,7 @@ test("the policy's pin table is exact", () => {
   assert.deepEqual(policyEntries(policyRules), [
     "mikelward/codex-review: ref-pin",
     "mikelward/codex-review/.github/workflows/check-consumer.yml: ref-pin",
+    "mikelward/lanes: ref-pin",
     "actions/*: ref-pin",
     "*: hash-pin",
   ]);

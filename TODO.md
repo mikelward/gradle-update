@@ -1,5 +1,15 @@
 # TODO
 
+## This repository
+
+- [ ] **Finish the gate → lanes check rename** (mikelward/lanes#9, same
+      staged procedure npm-update is mid-way through). The `lanes` job now
+      runs alongside `gate` (both green here), but two steps remain,
+      outside what a session without ruleset API access can do: flip the
+      ruleset to require `lanes` instead of `gate`, then delete the
+      now-redundant `gate` job and its parity test
+      (`workflow-check-rename.test.js`) in a follow-up PR.
+
 ## Reconsider later
 
 - **`docs/PAT.md`'s personal access token is the currently used path for

@@ -20,7 +20,7 @@ on:
     types: [opened, synchronize, reopened, edited]
 
 # Nothing here writes to the repository. The docs lane's classify and gate
-# steps read the PR's files and commits through the workflow token;
+# jobs read the PR's files and commits through the workflow token;
 # read-only, and still nothing here can write.
 permissions:
   contents: read
@@ -28,34 +28,25 @@ permissions:
 
 jobs:
   # Decides whether the test job may skip: true only when every changed
-  # file in the PR is housekeeping (markdown — see scripts/docs-lane.sh for
-  # the rule). Pushes to main are always classified as code.
+  # file in the PR is housekeeping (markdown — see .github/lanes.conf for
+  # the rule; the engine is mikelward/lanes). Pushes to main are always
+  # classified as code.
   classify:
     name: Classify the diff
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      docs_only: ${{ steps.run.outputs.docs_only }}
+      docs_only: ${{ steps.lane.outputs.docs_only }}
+      base_sha: ${{ steps.lane.outputs.base_sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
-      - name: Self-test the lane rules
-        # Before trusting the classification, prove the rule engine against
-        # its fixture matrix (stubbed gh, both directions per behavior). A
-        # broken rule fails here, the test job skips on the failed
-        # dependency, and the gate goes red — fail closed, never green.
-        run: scripts/docs-lane.test.sh
-      - name: Classify
-        id: run
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
-          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
-          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: scripts/docs-lane.sh classify >> "$GITHUB_OUTPUT"
+      - uses: mikelward/lanes@main
+        id: lane
+        with:
+          mode: classify
+          pr: ${{ github.event.pull_request.number }}
 
   test:
     runs-on: ubuntu-latest
@@ -77,14 +68,17 @@ jobs:
       - name: Test
         run: node --test *.test.js
 
-      - name: Shellcheck the lane scripts
-        run: shellcheck -s bash -S error scripts/docs-lane.sh scripts/docs-lane.test.sh
-
   # The one check the main ruleset requires. Always runs, always reports —
   # green only when the test job succeeded, or when it was skipped and the
-  # skip is INDEPENDENTLY verified as justified: the diff re-derived as
-  # housekeeping-only and every commit subject carrying a housekeeping
-  # prefix. Any other combination is an explicit red, never a silent pass.
+  # skip is INDEPENDENTLY verified as justified: the gate re-derives the
+  # classification itself rather than trusting classify's output. Any other
+  # combination is an explicit red, never a silent pass.
+  #
+  # TEMPORARY, alongside `lanes` below: mikelward/lanes renamed its
+  # consumer-facing check from `gate` to `lanes` (mikelward/lanes#9), and the
+  # ruleset here still requires `gate`. Per that PR's staged-rename
+  # procedure, this duplicate keeps `gate` reporting until the ruleset is
+  # flipped to require `lanes` instead — then this job is deleted.
   gate:
     name: gate
     runs-on: ubuntu-latest
@@ -95,17 +89,37 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
-      - name: Verdict
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
-          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
-          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          CLASSIFY: ${{ needs.classify.result }}
-          # Every job the gate weighs: a job added to this workflow but
-          # missing from RESULTS (and needs) is invisible to the verdict.
-          RESULTS: >-
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+          pr: ${{ github.event.pull_request.number }}
+          classify-result: ${{ needs.classify.result }}
+          # Only read on a dispatched run, and harmless on a pull_request one,
+          # which takes the same commit from its own event payload.
+          base-sha: ${{ needs.classify.outputs.base_sha }}
+          results: >-
             test=${{ needs.test.result }}
-        run: scripts/docs-lane.sh gate
+
+  # The renamed check (mikelward/lanes#9) — this is what the ruleset should
+  # require once it has reported at least once. Identical to `gate` above;
+  # see that job's comment for why both exist for now.
+  lanes:
+    name: lanes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [classify, test]
+    if: always()
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+          pr: ${{ github.event.pull_request.number }}
+          classify-result: ${{ needs.classify.result }}
+          # Only read on a dispatched run, and harmless on a pull_request one,
+          # which takes the same commit from its own event payload.
+          base-sha: ${{ needs.classify.outputs.base_sha }}
+          results: >-
+            test=${{ needs.test.result }}
