@@ -104,21 +104,11 @@ test("nondefault_opened_pr crosses the resolve/open-PR step split via the adopt 
   assert.match(workflow, /adopt="\$RESOLVED_ADOPT"/, "the open-PR step must assign adopt from $RESOLVED_ADOPT before deriving nondefault_opened_pr");
 });
 
-test("the CI dispatch and its PR-body claim key off nondefault_opened_pr, not the raw NONDEFAULT_TOKEN_USED flag", () => {
+test("the CI dispatch keys off nondefault_opened_pr, not the raw NONDEFAULT_TOKEN_USED flag", () => {
   assert.match(
     workflow,
     /if \[ "\$nondefault_opened_pr" != 'true' \] && \[ -n "\$CI_WORKFLOW" \]; then/,
     "the dispatch-skip condition was not found keyed on nondefault_opened_pr",
-  );
-  assert.match(
-    workflow,
-    /if \[ "\$nondefault_opened_pr" = 'true' \] && \[ -n "\$PAT" \]; then/,
-    "the PAT PR-body message-selection branch was not found keyed on nondefault_opened_pr",
-  );
-  assert.match(
-    workflow,
-    /elif \[ "\$nondefault_opened_pr" = 'true' \]; then/,
-    "the App PR-body message-selection branch was not found keyed on nondefault_opened_pr",
   );
 
   // nondefault_opened_pr must require THIS run to have put the real
@@ -134,9 +124,23 @@ test("the CI dispatch and its PR-body claim key off nondefault_opened_pr, not th
   );
 });
 
-test("the PR-body message distinguishes a PAT-opened PR from an App-opened one", () => {
-  assert.match(workflow, /opened under a personal access token/, "the PAT-specific PR-body wording was not found");
-  assert.match(workflow, /opened under a GitHub App installation/, "the App-specific PR-body wording was not found");
+test("the PR-body only calls out CI when neither a native trigger nor the dispatch started it", () => {
+  // The PAT-vs-App-vs-dispatched narration was cut: a reviewer gets no
+  // actionable value from being told which identity opened the PR or why
+  // `on: pull_request` did or didn't fire. Only the case that leaves the
+  // reviewer with something to do — CI genuinely didn't start — still
+  // prints a note, and it prints unconditionally on that one guard rather
+  // than via a PAT/App/dispatched elif chain.
+  assert.match(
+    workflow,
+    /if \[ "\$nondefault_opened_pr" != 'true' \] && \[ "\$ci_started" != true \]; then/,
+    "the collapsed CI-not-started condition was not found",
+  );
+  assert.doesNotMatch(workflow, /opened under a personal access token/, "the PAT-specific PR-body narration should have been removed");
+  assert.doesNotMatch(workflow, /opened under a GitHub App installation/, "the App-specific PR-body narration should have been removed");
+  assert.doesNotMatch(workflow, /These ran in the workflow job, not on this PR/, "the dispatched-CI narration should have been removed");
+  assert.match(workflow, /CI was not started on this branch by this job/, "the actionable CI-not-started note was not found");
+  assert.match(workflow, /push any commit to the branch/, "the actionable push-a-commit fallback was not found");
 });
 
 test("a PAT- or App-opened PR gets an explicit @codex review nudge, retried like the body edit", () => {
