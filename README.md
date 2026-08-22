@@ -102,8 +102,10 @@ whether Actions may open pull requests at all, and it defaults to off.
 Inputs (all optional): `catalog`, `cooldown-days`, `java-version`, `checks`
 (commands one per line, default `./gradlew test` + `./gradlew lint`),
 `review-checks` (commands one per line, default empty — see below),
-`commit-prefix` (default `internal:`, the Android repos' release-notes
-filter; the web repos use `deps:`), and `ci-workflow` (default
+`commit-prefix` (default empty — the batch commit is bare, like any other
+release-worthy change, since a dependency bump does change the shipped
+build and its subject ships straight to Play/Firebase release notes on the
+Android repos), and `ci-workflow` (default
 `android-ci.yml`) — a consumer workflow dispatched against the pushed
 branch. A pull request opened under GITHUB_TOKEN's identity DOES trigger a
 consumer's own `on: pull_request` workflows, same as any other, but GitHub

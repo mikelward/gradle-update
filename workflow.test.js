@@ -825,3 +825,56 @@ test("the verdict record fails closed on unknown lines and count mismatches", ()
   });
   assert.match(doubled, /flagged=false/);
 });
+
+function extractPrefixTitleBlock(text) {
+  const startMarker = 'prefix="$COMMIT_PREFIX"';
+  const start = text.indexOf(startMarker);
+  assert.notEqual(start, -1, "prefix/title block start marker not found in gradle-update.yml");
+  const endMarker = "verdict='All checks passed in the job that produced this branch.'\n          fi";
+  const end = text.indexOf(endMarker, start);
+  assert.notEqual(end, -1, "prefix/title block end marker not found");
+  const raw = text.slice(start, end + endMarker.length);
+  return raw.replace(/^ {10}/gm, "");
+}
+
+function runPrefixTitleBlock({ commitPrefix, passed, reviewFlagged }) {
+  const script = `set -euo pipefail\n${extractPrefixTitleBlock(workflow)}\nprintf '%s' "$title"\n`;
+  return execFileSync("bash", ["-c", script, "bash"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      COMMIT_PREFIX: commitPrefix ?? "",
+      PASSED: passed ?? "true",
+      REVIEW_FLAGGED: reviewFlagged ?? "false",
+      today: "2026-08-22",
+    },
+  });
+}
+
+test("an empty commit-prefix (the default) leaves the title bare, with no leading space", () => {
+  // The batch commit ships to Play/Firebase release notes on the Android
+  // repos, so it now defaults to no prefix at all — a leading space left
+  // over from naively prepending "$COMMIT_PREFIX " would be a visible typo
+  // on every "What's new" card and in every commit subject.
+  assert.equal(runPrefixTitleBlock({ commitPrefix: "" }), "Update dependencies (2026-08-22)");
+  assert.equal(
+    runPrefixTitleBlock({ commitPrefix: "", passed: "false" }),
+    "Update dependencies (2026-08-22) — CHECKS FAILING",
+  );
+  assert.equal(
+    runPrefixTitleBlock({ commitPrefix: "", passed: "true", reviewFlagged: "true" }),
+    "Update dependencies (2026-08-22) — NEEDS HUMAN REVIEW",
+  );
+});
+
+test("a non-empty commit-prefix still ships with exactly one separating space", () => {
+  // A consumer that opts back into a prefix (the Android repos' own
+  // `internal:` category, or a bespoke one) gets the same single-space
+  // join the hardcoded prefix used to produce — this is a config knob now,
+  // not a change in what a supplied prefix looks like.
+  assert.equal(runPrefixTitleBlock({ commitPrefix: "internal:" }), "internal: Update dependencies (2026-08-22)");
+  assert.equal(
+    runPrefixTitleBlock({ commitPrefix: "deps:", passed: "false" }),
+    "deps: Update dependencies (2026-08-22) — CHECKS FAILING",
+  );
+});

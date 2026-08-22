@@ -89,11 +89,13 @@ on:
         default: ''
       commit-prefix:
         description: >-
-          Subject prefix for the batch commit and PR title. The Android repos
-          keep dependency bumps out of release notes with `internal:`; the
-          web repos use `deps:`.
+          Optional subject prefix for the batch commit and PR title, e.g.
+          'internal:' or 'deps:'. Empty by default: a dependency bump does
+          change the shipped build, and on the Android repos the commit
+          subject ships straight to Play/Firebase release notes, so the
+          batch commit is bare like any other release-worthy change.
         type: string
-        default: 'internal:'
+        default: ''
       ci-workflow:
         description: >-
           Workflow file to dispatch against the pushed branch, with a `pr`
@@ -1737,17 +1739,25 @@ jobs:
           today=${created%%T*}
           branch="deps/update-$today"
 
+          # Empty by default (see the commit-prefix input) — only add the
+          # trailing space when a consumer actually sets one, so a bare
+          # title never picks up a leading space.
+          prefix="$COMMIT_PREFIX"
+          if [ -n "$prefix" ]; then
+            prefix="$prefix "
+          fi
+
           # A failing check outranks a review flag in the title: a red batch
           # is broken first, reviewable second. Both are reported in full in
           # the body either way, and EITHER condition holds auto-merge back.
           if [ "$PASSED" != 'true' ]; then
-            title="$COMMIT_PREFIX Update dependencies ($today) — CHECKS FAILING"
+            title="${prefix}Update dependencies ($today) — CHECKS FAILING"
             verdict='**One or more checks failed.** Do not merge until they are fixed — the failures are real, not flakes to route around.'
           elif [ "$REVIEW_FLAGGED" = 'true' ]; then
-            title="$COMMIT_PREFIX Update dependencies ($today) — NEEDS HUMAN REVIEW"
+            title="${prefix}Update dependencies ($today) — NEEDS HUMAN REVIEW"
             verdict='All checks passed, but a review check flagged this batch — see **Review** below. Auto-merge is deliberately not armed; merge by hand once the flagged change is acceptable.'
           else
-            title="$COMMIT_PREFIX Update dependencies ($today)"
+            title="${prefix}Update dependencies ($today)"
             verdict='All checks passed in the job that produced this branch.'
           fi
 
