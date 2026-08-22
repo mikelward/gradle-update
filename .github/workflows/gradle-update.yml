@@ -2157,34 +2157,16 @@ jobs:
             fi
             echo "$verdict"
             echo
-            if [ "$nondefault_opened_pr" = 'true' ] && [ -n "$PAT" ]; then
-              echo '> This pull request was opened under a personal access token'"'"'s'
-              echo '> identity — a real repository collaborator — so this repository'"'"'s'
-              echo '> `on: pull_request` workflows started on it normally, the same as any'
-              echo '> human-opened pull request. Nothing here needed to dispatch them'
-              echo '> separately.'
-            elif [ "$nondefault_opened_pr" = 'true' ]; then
-              echo '> This pull request was opened under a GitHub App installation'"'"'s'
-              echo '> identity — a real repository collaborator — so this repository'"'"'s'
-              echo '> `on: pull_request` workflows started on it normally, the same as any'
-              echo '> human-opened pull request. Nothing here needed to dispatch them'
-              echo '> separately.'
-            elif [ "$ci_started" = true ]; then
-              echo '> These ran in the workflow job, not on this PR. A pull request opened'
-              echo '> under GITHUB_TOKEN'"'"'s identity does trigger this repository'"'"'s own'
-              echo '> `on: pull_request` workflows, same as any other — but GitHub gates that'
-              echo '> run pending manual approval, since that identity is not a repository'
-              echo "> collaborator. This job dispatched \`$CI_WORKFLOW\` against the branch"
-              echo '> instead, which sidesteps the gate, and that run reports on this PR like'
-              echo '> any other.'
-            else
+            # Nothing prints for a native `on: pull_request` trigger
+            # (nondefault_opened_pr) or a successful dispatch (ci_started) —
+            # in both cases CI is already running and the checks report says
+            # so. Only the case where neither started CI needs a reviewer's
+            # attention.
+            if [ "$nondefault_opened_pr" != 'true' ] && [ "$ci_started" != true ]; then
               echo '> **CI was not started on this branch by this job, so the checks above'
-              echo '> are the only ones that ran here.** A pull request opened under'
-              echo '> GITHUB_TOKEN'"'"'s identity does trigger this repository'"'"'s own'
-              echo '> `on: pull_request` workflows, but GitHub gates that run pending manual'
-              echo '> approval — check this pull request'"'"'s checks tab for one waiting on'
-              echo '> that, or push any commit to the branch and CI runs normally from then'
-              echo '> on.'
+              echo '> are the only ones that ran here.** Check this pull request'"'"'s checks'
+              echo '> tab for one waiting on manual approval, or push any commit to the branch'
+              echo '> and CI runs normally from then on.'
             fi
             echo
             echo '## Changed'
