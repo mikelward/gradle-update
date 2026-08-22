@@ -1,22 +1,38 @@
-# Advisory scan of the workflows with zizmor (https://docs.zizmor.sh).
+# Scan of the workflows with zizmor (https://docs.zizmor.sh).
 #
-# Advisory MEANS advisory: the ruleset does not require this check, on
-# purpose. Running it fetches zizmor from PyPI, and a registry outage must
-# not stall a merge gate — the same reasoning that keeps PyYAML
-# uninstalled in codex-review's check-consumer.yml. A red run here is a
-# finding to read, not a gate.
+# Required, not advisory -- reversing the posture this was ported with, by
+# the owner's decision: `zizmor` joins `lanes` and `codex` in the fleet's
+# standard required set (the ruleset half is TODO.md's pending step:
+# until the ruleset itself lists `zizmor`, a red scan does not yet hold
+# merges), piloted in mikelward/lanes and
+# mikelward/ci-commit-artifact and rolled out here. That is why there is
+# no `paths:` filter: a workflow filtered out by paths creates NO check
+# run at all (unlike a skipped job, which reports "skipped" and satisfies
+# a ruleset), so a required `zizmor` plus a path filter would leave any
+# pull request not touching `.github/**` waiting forever on a check
+# nothing reports. The scan is a free sub-minute job, so it simply runs
+# on every pull request and every push to main. The accepted cost: fetching
+# zizmor from PyPI is the one network step (--offline covers the scan
+# itself), and once the check is required, a PyPI outage fails it and
+# holds merges until a re-run succeeds.
 #
 # The version is pinned because a new zizmor release adds audits, so an
 # unpinned run could turn red with no change in this repository. Bump it
 # deliberately and re-read the findings. The policy exceptions live in
 # .github/zizmor.yml, beside this file.
+#
+# `pull_request` lists its types explicitly because the default set lacks
+# `edited`: a retarget regenerates the merge ref against the new base while
+# the head -- and the green `zizmor` check already attached to it -- stays
+# put, so without `edited` the old target's scan would satisfy the new one
+# unexamined. Title and body edits re-run the scan too; redundant but
+# cheap, the same trade ci.yml makes for the lane jobs.
 name: zizmor
 on:
   push:
     branches: [main]
-    paths: ['.github/**']
   pull_request:
-    paths: ['.github/**']
+    types: [opened, synchronize, reopened, edited]
 permissions:
   contents: read
 jobs:

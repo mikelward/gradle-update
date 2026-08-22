@@ -65,20 +65,29 @@ test("the scan holds read-only permissions, top-level only", () => {
   assert.equal([...workflow.matchAll(/^ *permissions:/gm)].length, 1);
 });
 
-test("the scan re-runs when anything it scans changes", () => {
-  // Both triggers filter to the same paths, compared whole rather than by
-  // membership: an appended pattern — above all a negation like
-  // !.github/workflows/** — must fail here, not ride along. .github/**
-  // covers the workflows and the policy, which is everything zizmor reads
-  // in this repository (there is no action.yml here).
-  const filters = [...workflow.matchAll(/paths: \[(.+)\]/g)].map((m) => m[1]);
-  assert.equal(filters.length, 2);
-  for (const f of filters) {
-    assert.deepEqual(
-      f.split(",").map((p) => p.trim()),
-      ["'.github/**'"],
-    );
-  }
+test("the scan runs on every pull request and push to main, with no paths filter", () => {
+  // `zizmor` is slated for the ruleset's required set (TODO.md holds
+  // the flip), and a required check must report on every pull request's
+  // head: a workflow filtered out by
+  // `paths:` creates NO check run at all — unlike a skipped job, which
+  // reports "skipped" and satisfies the ruleset — so a filter here would
+  // leave any PR not touching the filtered paths unmergeable behind a
+  // check nothing reports. Matched as one contiguous block that runs
+  // straight from `on:` into `permissions:`, so `pull_request:` provably
+  // carries NO nested configuration — not just no `paths:`: a `types:`
+  // filter under it would equally stop the check reporting on opened or
+  // synchronized heads. The one nested key allowed is the explicit types
+  // list, `edited` included: a retarget regenerates the merge ref against
+  // the new base while the head — and the green check attached to it —
+  // stays put, so the default types (which lack `edited`) would let the
+  // old target's scan satisfy the new one. The separate no-paths
+  // assertion keeps a filter from riding on any future trigger this
+  // block match doesn't cover.
+  assert.match(
+    workflow,
+    /\non:\n  push:\n    branches: \[main\]\n  pull_request:\n    types: \[opened, synchronize, reopened, edited\]\npermissions:\n/,
+  );
+  assert.doesNotMatch(workflow, /^\s*paths:/m);
 });
 
 test("the policy's pin table is exact", () => {
