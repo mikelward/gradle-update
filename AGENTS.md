@@ -62,13 +62,14 @@ fingerprinted boundary removes the guarantee the two-job split provides.
   human-initiated migration; the newest one is reported under "Held back",
   never taken. The calendar-versioned Compose BOM treats the year as the
   major on purpose — conservative, and it holds a batch back once a year.
-- **Nothing silently skipped — of what the catalog declares.** A rich version
+- **Nothing silently skipped — of what the engine can see.** A rich version
   or range, a `version.ref` with no `[versions]` entry, a key nothing
-  references: each is named in the PR body under "Not managed" rather than
-  dropped. A version pinned *outside* the catalog is the one thing that never
-  reaches that list, because the engine reads only the catalog and so never
-  sees it. A batch that quietly ignores something it can see is worse than one
-  that says it can't handle it.
+  references, a plugin pinned inline in a root script: each is named in the PR
+  body under "Not managed" rather than dropped. What stays invisible is what
+  the engine never reads — a library coordinate hard-coded in a build file, a
+  pin in a module script — and that limit gets stated, not papered over. A
+  batch that quietly ignores something it can see is worse than one that says
+  it can't handle it.
 
 ## Testing
 

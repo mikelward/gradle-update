@@ -6,6 +6,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  scanPluginPins,
+  scanScript,
+  stripScriptComments,
   parseCatalog,
   versionRefOf,
   parseInlineTable,
@@ -21,6 +24,7 @@ import {
   updateCatalog,
   reportMarkdown,
   httpsFetcher,
+  unmanagedPinLine,
 } from "./update-versions.mjs";
 
 // ---------------------------------------------------------------------------
@@ -980,3 +984,568 @@ test("httpsFetcher caps redirect chains rather than looping forever", async () =
     /too many redirects/,
   );
 });
+
+// ---------------------------------------------------------------------------
+// Pins the catalog cannot see.
+// ---------------------------------------------------------------------------
+
+// The real shape this exists for: the sibling Android consumers pin the
+// Compose compiler plugin in `pluginManagement`, and foojay in the settings
+// `plugins {}` block, where the catalog never sees either.
+const SETTINGS_FIXTURE = `pluginManagement {
+    repositories {
+        maven { url = uri("https://example.com//artifacts") }
+        gradlePluginPortal()
+    }
+    plugins {
+        id("org.jetbrains.kotlin.plugin.compose") version "2.4.10"
+        // id("org.example.retired") version "9.9.9"
+    }
+}
+plugins {
+    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
+}
+`;
+
+test("scanPluginPins reports every literal plugin pin in a settings script", () => {
+  const pins = scanPluginPins(SETTINGS_FIXTURE);
+  assert.deepEqual(pins, [
+    { id: "org.jetbrains.kotlin.plugin.compose", version: "2.4.10", computedId: false },
+    { id: "org.gradle.toolchains.foojay-resolver-convention", version: "1.0.0", computedId: false },
+  ]);
+});
+
+test("scanPluginPins ignores a commented-out pin", () => {
+  // Asserted against the fixture above, which carries one — so this fails if
+  // the fixture ever loses it rather than passing on an empty scan.
+  assert.match(SETTINGS_FIXTURE, /\/\/ *id\("org\.example\.retired"\)/);
+  assert.equal(
+    scanPluginPins(SETTINGS_FIXTURE).some((p) => p.id === "org.example.retired"),
+    false,
+  );
+});
+
+test("scanPluginPins leaves a catalog alias alone", () => {
+  // `alias(libs.plugins.x)` and a bare `id(...)` carry no literal version, so
+  // the catalog already owns them and there is nothing to report.
+  const pins = scanPluginPins(`plugins {
+    alias(libs.plugins.android.application) apply false
+    id("org.jetbrains.kotlin.plugin.compose")
+}`);
+  assert.deepEqual(pins, []);
+});
+
+test("scanPluginPins reads both Groovy spellings", () => {
+  assert.deepEqual(
+    scanPluginPins("plugins {\n  id 'com.example.one' version '1.2'\n  id('com.example.two').version('2.0')\n}"),
+    [
+      { id: "com.example.one", version: "1.2", computedId: false },
+      { id: "com.example.two", version: "2.0", computedId: false },
+    ],
+  );
+});
+
+test("scanPluginPins reports a pin once however often it is mentioned", () => {
+  const pins = scanPluginPins(`pluginManagement {
+    plugins { id("com.example.one") version "1.2" }
+}
+plugins { id("com.example.one") version "1.2" }`);
+  assert.deepEqual(pins, [{ id: "com.example.one", version: "1.2", computedId: false }]);
+});
+
+test("stripScriptComments does not cut a URL at its double slash", () => {
+  // The reason the strip is quote-aware: a naive one truncates every
+  // repository URL, which is how a scan starts inventing pins.
+  const stripped = stripScriptComments('maven { url = uri("https://example.com//a") } // trailing');
+  assert.match(stripped, /https:\/\/example\.com\/\/a/);
+  assert.doesNotMatch(stripped, /trailing/);
+});
+
+test("stripScriptComments removes a block comment without joining its neighbors", () => {
+  assert.equal(stripScriptComments("a/* cut */b"), "a b");
+});
+
+test("scanPluginPins reads Gradle's kotlin() shorthand", () => {
+  // `kotlin("jvm")` names org.jetbrains.kotlin.jvm through a different
+  // keyword; missing it would leave exactly the pin this scan exists to find.
+  assert.deepEqual(
+    scanPluginPins(`plugins {
+    kotlin("jvm") version "2.1.0"
+    kotlin("plugin.serialization") version "2.1.0"
+}`),
+    [
+      { id: "org.jetbrains.kotlin.jvm", version: "2.1.0", computedId: false },
+      { id: "org.jetbrains.kotlin.plugin.serialization", version: "2.1.0", computedId: false },
+    ],
+  );
+});
+
+test("scanPluginPins ignores a declaration that is only string content", () => {
+  // A generated-script template or a printed message is data, not a
+  // declaration, and reporting it would put a plugin nobody declared in the
+  // weekly PR.
+  assert.deepEqual(
+    scanPluginPins(`println('id("com.example.foo") version "1.2.3"')`),
+    [],
+  );
+  assert.deepEqual(
+    scanPluginPins('val template = "id(\\"com.example.foo\\") version \\"1.2.3\\""'),
+    [],
+  );
+});
+
+test("scanPluginPins still reports a real pin on a line that also has a string", () => {
+  // The narrowing must not cost a real finding: the mask is consulted for the
+  // keyword's position only, and a declaration's own arguments are strings.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.one") version "1.2" } // note: "quoted"`),
+    [{ id: "com.example.one", version: "1.2", computedId: false }],
+  );
+});
+
+test("scanScript marks string interiors and leaves code unmarked", () => {
+  const { text, inString } = scanScript('id("a")');
+  assert.equal(text, 'id("a")');
+  // Assert the scan actually found the token before trusting the mask.
+  assert.equal(text.indexOf("id"), 0);
+  assert.equal(inString[0], false); // the `id` keyword is code
+  assert.equal(inString[text.indexOf("a")], true); // the argument is not
+});
+
+test("a triple-quoted string does not swallow the code after it", () => {
+  // The failure this guards is a MISSED pin, not a spurious one: treating
+  // `"""` as three single quotes flipped the quote parity whenever the body
+  // held an odd number of them, so every real declaration after it was marked
+  // as string content and dropped.
+  const script = `val t = """say " now"""
+plugins { id("com.example.real") version "1.2" }`;
+  // Assert the body really does carry the odd quote that used to break it.
+  assert.match(script, /"""say " now"""/);
+  assert.deepEqual(scanPluginPins(script), [
+    { id: "com.example.real", version: "1.2", computedId: false },
+  ]);
+});
+
+test("a declaration inside a triple-quoted template is not reported", () => {
+  assert.deepEqual(scanPluginPins('val t = """id("fake") version "9.9""""'), []);
+  assert.deepEqual(scanPluginPins("val t = \'\'\'id(\"fake\") version \"9.9\"\'\'\'"), []);
+});
+
+test("scanPluginPins reads raw-string arguments as whole literals", () => {
+  // `id("""x""") version """1.0"""` is valid Kotlin. Taking the first quote of
+  // each triple as the delimiter reported the pin as `""x""` at version `"`,
+  // which is not noise but a wrong entry naming a pin the engine can see.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("""com.example.foo""") version """1.2.3""" }`),
+    [{ id: "com.example.foo", version: "1.2.3", computedId: false }],
+  );
+  // Mixed delimiters in one declaration are legal too.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("""com.example.two""") version "9.9" }`),
+    [{ id: "com.example.two", version: "9.9", computedId: false }],
+  );
+});
+
+// One fixture, read under each language's comment rules. There is no outer
+// `*/` on purpose: under Kotlin's the inner one only closes the inner comment,
+// so the whole file is comment, while under Groovy's it closes the only
+// comment there is and a live declaration follows. That is the entire
+// difference between the two tests below, and it is why the caller states the
+// language rather than the scanner guessing — nesting a Groovy comment would
+// run past its real end and swallow a pin.
+const NESTED_COMMENT_SRC = `plugins { /* outer /* inner */ id("com.example.fake") version "1.2" }`;
+
+test("a raw-string argument cannot cross its own closing triple", () => {
+  // The same runaway the whole-literal alternation was written to rule out,
+  // surviving in the branches that could still cross themselves: a lazy run
+  // backtracks past its own closing delimiter when the rest of the pattern
+  // fails, so an unversioned raw-string declaration ahead of a real one
+  // produced ONE corrupted id spanning both and swallowed the pin.
+  assert.deepEqual(
+    scanPluginPins(
+      `plugins {\n  id("""java""")\n  id("""com.example.real""") version """1.2"""\n}`,
+      { nestedBlockComments: true },
+    ),
+    [{ id: "com.example.real", version: "1.2", computedId: false }],
+  );
+  // Groovy's triple-quote spelling has the same shape and the same fix.
+  assert.deepEqual(
+    scanPluginPins(
+      `plugins {\n  id('''java''')\n  id('''com.example.g''') version '''1.2'''\n}`,
+    ),
+    [{ id: "com.example.g", version: "1.2", computedId: false }],
+  );
+  // The guard: a raw string may still contain a lone quote, which is the case
+  // a delimiter that stopped at every quote would have broken.
+  assert.deepEqual(
+    scanPluginPins(`val t = """say " now"""\nplugins { id("com.example.q") version "1.2" }`),
+    [{ id: "com.example.q", version: "1.2", computedId: false }],
+  );
+});
+
+test("a nested block comment is comment all the way to its outer close in Kotlin", () => {
+  assert.deepEqual(scanPluginPins(NESTED_COMMENT_SRC, { nestedBlockComments: true }), []);
+});
+
+test("a nested block comment closes at the first terminator in Groovy", () => {
+  assert.deepEqual(scanPluginPins(NESTED_COMMENT_SRC), [
+    { id: "com.example.fake", version: "1.2", computedId: false },
+  ]);
+});
+
+test("an ordinary block comment still yields the pin after it, either way", () => {
+  // The guard against depth tracking costing a real finding.
+  const src = `/* c */ plugins { id("com.example.real") version "1.2" }`;
+  for (const options of [undefined, { nestedBlockComments: true }]) {
+    assert.deepEqual(scanPluginPins(src, options), [
+      { id: "com.example.real", version: "1.2", computedId: false },
+    ]);
+  }
+});
+
+test("scanPluginPins reports a pin whose version is a name, not a literal", () => {
+  // `version pluginVersion` is a valid declaration Gradle resolves to whatever
+  // the variable holds. Matching only the literal spelling produced NO entry
+  // at all for it — not a withheld value, an omitted plugin — which is the
+  // silent skip the whole scan exists to prevent.
+  assert.deepEqual(
+    scanPluginPins(`def pluginVersion = "1.2"
+plugins { id("com.example.foo") version pluginVersion }`),
+    [{ id: "com.example.foo", version: null, computedId: false }],
+  );
+  // The catalog-accessor spelling, and the parenthesized Kotlin one.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.bar") version libs.versions.bar.get() }`),
+    [{ id: "com.example.bar", version: null, computedId: false }],
+  );
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.baz").version(pluginVersion) }`),
+    [{ id: "com.example.baz", version: null, computedId: false }],
+  );
+  // Still nothing for a declaration that pins no version at all — the `version`
+  // keyword is what separates the two, not the shape of what follows it.
+  assert.deepEqual(scanPluginPins(`plugins { id("com.example.none") }`), []);
+});
+
+test("scanPluginPins reports a pin whose version operand is any expression", () => {
+  // The `version` keyword is what marks a pin, not the shape of what follows
+  // it. An operand that starts with punctuation matched none of the shapes the
+  // pattern used to enumerate, so the declaration produced no entry at all —
+  // the same silent skip as the variable-only case, one shape further out.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.foo").version(["1.2"][0]) }`),
+    [{ id: "com.example.foo", version: null, computedId: false }],
+  );
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.bar") version project.ext["v"] }`),
+    [{ id: "com.example.bar", version: null, computedId: false }],
+  );
+  // The guard the optional operand needs: `version` absent still reports
+  // nothing, so widening what may follow the keyword has not turned every
+  // declaration into a pin.
+  assert.deepEqual(scanPluginPins(`plugins { id("com.example.none") }`), []);
+  assert.deepEqual(
+    scanPluginPins(`plugins { alias(libs.plugins.foo) apply false }`),
+    [],
+  );
+});
+
+test("only a `plugins { … }` block holds plugin declarations", () => {
+  // The operands on both sides are permissive on purpose — that is what ended
+  // the shape enumeration — and the cost was that an ordinary `id(...)` call in
+  // one statement and an ordinary `version` in the next completed a match
+  // BETWEEN them, reporting a plugin nobody declared. Excluding one spelling at
+  // a time (`version =`, then `version.toString()`, …) is that same open-ended
+  // enumeration seen from the other end; the block boundary ends the class.
+  for (const after of ['version = "1.2"', "version.toString()", 'version("1.2")']) {
+    assert.deepEqual(
+      scanPluginPins(`val artifactId = id("com.example.library")\n${after}\n`, {
+        nestedBlockComments: true,
+      }),
+      [],
+    );
+  }
+  // Inside a block, all three still read as declarations.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.real") version "1.2" }`),
+    [{ id: "com.example.real", version: "1.2", computedId: false }],
+  );
+  // Nested inside `pluginManagement`, which is where a settings script puts it.
+  assert.deepEqual(
+    scanPluginPins(`pluginManagement {\n  plugins {\n    id("com.example.s") version "1.0"\n  }\n}`),
+    [{ id: "com.example.s", version: "1.0", computedId: false }],
+  );
+  // A brace inside a string does not close the block early.
+  assert.deepEqual(
+    scanPluginPins(`plugins {\n  // a }\n  id("com.example.brace") version "1.0"\n}`),
+    [{ id: "com.example.brace", version: "1.0", computedId: false }],
+  );
+  // And the word inside a string does not open one.
+  assert.deepEqual(
+    scanPluginPins(`val s = "plugins {"\nid("com.example.nope") version "1.0"`),
+    [],
+  );
+});
+
+test("a computed id may be a call chain split over several lines", () => {
+  // Ordinary Kotlin formatting. Excluding newlines from the argument dropped
+  // the declaration entirely — a silent omission, not a withheld value.
+  const pins = scanPluginPins(
+    `plugins {\n  id(providers\n    .gradleProperty("pluginId")\n    .get()) version "1.2"\n}`,
+    { nestedBlockComments: true },
+  );
+  assert.equal(pins.length, 1);
+  assert.equal(pins[0].version, "1.2");
+  assert.equal(pins[0].computedId, true);
+  // Collapsed onto one line, so the reported line stays a line.
+  assert.equal(pins[0].id, 'providers .gradleProperty("pluginId") .get()');
+  // The guard: it still cannot run from one declaration into the next.
+  assert.deepEqual(
+    scanPluginPins(`plugins {\n  id("java")\n  id("com.example.real") version "1.2"\n}`),
+    [{ id: "com.example.real", version: "1.2", computedId: false }],
+  );
+});
+
+test("a `version =` assignment does not complete a plugin declaration", () => {
+  // Gradle's project-version assignment is not the declaration keyword. Once
+  // the version operand became optional, an `id(...)` call in one statement and
+  // this assignment in the next completed a match ACROSS them and reported a
+  // plugin nobody declared — a wrong entry, which is worse than a missing or a
+  // spurious one.
+  assert.deepEqual(
+    scanPluginPins('val artifactId = id("com.example.library")\nversion = "1.2"\n', {
+      nestedBlockComments: true,
+    }),
+    [],
+  );
+  // The guard: a real declaration on its own line still reports.
+  assert.deepEqual(
+    scanPluginPins(`plugins {\n  id("com.example.real") version "1.2"\n}`),
+    [{ id: "com.example.real", version: "1.2", computedId: false }],
+  );
+});
+
+test("a bare core-plugin accessor ends a version expression", () => {
+  // `plugins { id("x") version "1.2"; java }` is ordinary Kotlin — `java` is a
+  // core-plugin accessor, not an operator. Whitelisting the WORDS that may
+  // follow a version could never cover them, because an accessor is any
+  // identifier Gradle publishes, so a real literal version got reported as
+  // non-literal the moment one appeared.
+  for (const accessor of ["java", "application", "war", "signing", "base"]) {
+    const pins = scanPluginPins(
+      `plugins {\n  id("com.example.foo") version "1.2"\n  ${accessor}\n}`,
+    );
+    // Asserted, so a fixture that stops reaching the branch cannot pass quietly.
+    assert.equal(pins.length, 1);
+    assert.equal(pins[0].version, "1.2");
+  }
+});
+
+test("a word operator does not end a version expression", () => {
+  // The terminator whitelist admitted any identifier for a round, so the `i`
+  // of a word operator read as the end of the expression and the fragment
+  // before it was reported as a pinned version.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.a").version("1" in ["1"] ? "2" : "3") }`),
+    [{ id: "com.example.a", version: null, computedId: false }],
+  );
+  // The rest of the closed set the check names — language keywords, which is
+  // why naming these rather than the terminators is the direction that works.
+  for (const [op, id] of [
+    ["as String", "com.example.as"],
+    ["is String", "com.example.is"],
+    ["instanceof String", "com.example.io"],
+  ]) {
+    assert.deepEqual(scanPluginPins(`plugins { id("${id}").version("1.2" ${op}) }`), [
+      { id, version: null, computedId: false },
+    ]);
+  }
+  // The words that DO end one come from the plugins DSL, and each still does:
+  // `apply` after a version, and the next declaration's own keyword.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.b") version "1.2" apply false }`),
+    [{ id: "com.example.b", version: "1.2", computedId: false }],
+  );
+  for (const next of ['id("com.example.z") version "2.0"', 'kotlin("jvm") version "2.0"', "alias(libs.plugins.x)"]) {
+    const pins = scanPluginPins(`plugins {\n  id("com.example.c") version "1.2"\n  ${next}\n}`);
+    // Asserted so a fixture that stops reaching the branch cannot pass quietly.
+    assert.equal(pins[0].id, "com.example.c");
+    assert.equal(pins[0].version, "1.2");
+  }
+});
+
+test("scanPluginPins reports a pin whose id is an expression", () => {
+  // `id(pluginId)` is a declaration Gradle resolves — in a settings
+  // `pluginManagement` block, which is not the restricted plugins DSL — and
+  // requiring a literal here produced no entry at all for it. Same silent skip
+  // as the version side, one argument over.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id(pluginId) version "1.2" }`),
+    [{ id: "pluginId", version: "1.2", computedId: true }],
+  );
+  // Two levels of nesting, which is what a property lookup and its `.get()`
+  // need.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id(providers.gradleProperty("suffix").get()) version "1.2" }`),
+    [
+      {
+        id: 'providers.gradleProperty("suffix").get()',
+        version: "1.2",
+        computedId: true,
+      },
+    ],
+  );
+  // And it reads as computed, so the expression is never printed as though it
+  // were the plugin's name.
+  assert.match(
+    unmanagedPinLine(scanPluginPins(`plugins { id(pluginId) version "1.2" }`)[0], "b"),
+    /^plugin with a computed id `pluginId`/,
+  );
+  // The guards a widened id argument needs. Empty parentheses are not a
+  // declaration, and neither is a declaration with no `version` keyword —
+  // widening what may sit between the parentheses is exactly the change that
+  // could have started reporting both.
+  assert.deepEqual(scanPluginPins(`plugins { id() version "1.2" }`), []);
+  assert.deepEqual(scanPluginPins(`plugins { id(pluginId) }`), []);
+  assert.deepEqual(scanPluginPins(`plugins { alias(libs.plugins.foo) apply false }`), []);
+  // Still cannot run from one declaration into the next: the argument never
+  // crosses a `)`.
+  assert.deepEqual(
+    scanPluginPins(`plugins {\n  id("java")\n  id("com.example.real") version "1.2"\n}`),
+    [{ id: "com.example.real", version: "1.2", computedId: false }],
+  );
+});
+
+test("an interpolated plugin id is reported as computed, not as a name", () => {
+  // Gradle resolves the template at configuration time, so the source text is
+  // not the plugin's id. Printing it as one names a plugin that does not
+  // exist — a wrong entry, which this repo ranks below a spurious one.
+  const src =
+    'plugins { id("com.example.${providers.gradleProperty(\'s\').get()}") version "1.2" }';
+  const pins = scanPluginPins(src);
+  // Asserted before the line, so this cannot pass on a scan that found nothing.
+  assert.equal(pins.length, 1);
+  assert.equal(pins[0].version, "1.2");
+  assert.match(
+    unmanagedPinLine(pins[0], "settings.gradle"),
+    /^plugin with a computed id `com\.example\.\$\{/,
+  );
+  // A `$name` template counts too, and so does one in the Kotlin spelling.
+  assert.match(
+    unmanagedPinLine(scanPluginPins('plugins { id("com.example.$suffix") version "1.2" }')[0], "b"),
+    /^plugin with a computed id /,
+  );
+});
+
+test("unmanagedPinLine names an ordinary pin plainly", () => {
+  // The guard against the two withholding branches swallowing the common case.
+  assert.equal(
+    unmanagedPinLine({ id: "com.example.foo", version: "1.2", computedId: false }, "settings.gradle.kts"),
+    'plugin com.example.foo: pinned "1.2" in settings.gradle.kts, outside the catalog',
+  );
+  assert.equal(
+    unmanagedPinLine({ id: "com.example.foo", version: null, computedId: false }, "settings.gradle.kts"),
+    "plugin com.example.foo: pinned in settings.gradle.kts with a non-literal version, outside the catalog",
+  );
+});
+
+test("scanPluginPins follows a version expression across a line break", () => {
+  // An expression continues over a newline freely, so this is the version 1.2
+  // Gradle resolves. Treating the line ending as a terminator reported the
+  // fragment `1.` — a plain version by the predicate, and pinned nowhere.
+  assert.deepEqual(
+    scanPluginPins(`plugins {
+    id("com.example.foo").version("1."
+        + "2")
+}`),
+    [{ id: "com.example.foo", version: null, computedId: false }],
+  );
+  // The guard against that fix costing a real finding: a pin that ends its
+  // line is still whole, whatever line the next terminator turns up on.
+  assert.deepEqual(
+    scanPluginPins(`plugins {
+    id("com.example.real") version "1.2"
+}`),
+    [{ id: "com.example.real", version: "1.2", computedId: false }],
+  );
+});
+
+test("scanPluginPins withholds a version it cannot read as a literal", () => {
+  // A quoted token is not automatically a pinned version. Reporting
+  // `$pluginVersion` or the fragment `1.` names a version that is pinned
+  // nowhere — a wrong entry, worse than saying nothing about the value. The
+  // pin itself is still reported: being outside the catalog is the fact the
+  // section exists to surface.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.foo") version "$pluginVersion" }`),
+    [{ id: "com.example.foo", version: null, computedId: false }],
+  );
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.bar").version("1." + minor) }`),
+    [{ id: "com.example.bar", version: null, computedId: false }],
+  );
+  // The method spelling of the same concatenation. Checking only for `+`
+  // caught the operator form and let this one report the fragment `1.`.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.baz").version("1.".plus(minor)) }`),
+    [{ id: "com.example.baz", version: null, computedId: false }],
+  );
+  // Groovy string repetition: `"1" * 2` is version 11, and naming operators
+  // one at a time had let `*` through to report the fragment `1`. The check
+  // is a whitelist of terminators now, so an unnamed operator cannot pass.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.qux").version("1" * 2) }`),
+    [{ id: "com.example.qux", version: null, computedId: false }],
+  );
+});
+
+test("scanPluginPins still reads a literal followed by apply false", () => {
+  // The guard against that rejection over-reaching: `apply false` is ordinary
+  // Gradle, so a whitelist of terminators would have withheld a real version.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.one") version "1.2" apply false }`),
+    [{ id: "com.example.one", version: "1.2", computedId: false }],
+  );
+  // And the parenthesized form, where `)` follows the literal, not `.`.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.two").version("1.2") }`),
+    [{ id: "com.example.two", version: "1.2", computedId: false }],
+  );
+  // A line ending and end-of-file finish the expression as surely as a
+  // bracket does — the two cases a terminator whitelist most easily forgets.
+  assert.deepEqual(
+    scanPluginPins(`plugins {\n  id("com.example.three") version "1.2"\n}`),
+    [{ id: "com.example.three", version: "1.2", computedId: false }],
+  );
+  assert.deepEqual(scanPluginPins(`plugins { id("com.example.four") version "1.2"`), [
+    { id: "com.example.four", version: "1.2", computedId: false },
+  ]);
+});
+
+test("scanPluginPins still reports an ordinary literal version", () => {
+  // The guard against that withholding costing a real value, including a
+  // prerelease qualifier, which isPlainVersion accepts.
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.one") version "1.2" }`),
+    [{ id: "com.example.one", version: "1.2", computedId: false }],
+  );
+  assert.deepEqual(
+    scanPluginPins(`plugins { id("com.example.two") version "1.0-alpha" }`),
+    [{ id: "com.example.two", version: "1.0-alpha", computedId: false }],
+  );
+});
+
+test("an unversioned declaration does not swallow the pin after it", () => {
+  // A lazy run between two delimiters backtracks across its own closing quote
+  // when the rest of the pattern fails, so `id("java")` ran into the next
+  // declaration: one corrupted id, and the real pin gone from the report.
+  // A missed pin is the failure this scan exists to prevent.
+  assert.deepEqual(
+    scanPluginPins(`plugins {
+    id("java")
+    id("com.example.real") version "1.2"
+}`),
+    [{ id: "com.example.real", version: "1.2", computedId: false }],
+  );
+});
+
