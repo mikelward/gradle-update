@@ -29,11 +29,38 @@ pass.
   `SNAPSHOT` and friends never enter a batch; stable *variants*
   (guava's `-android` / `-jre`) do.
 
-What it deliberately does not manage: versions written outside the catalog
-(a plugin version pinned in `settings.gradle.kts`), rich versions
-(`{ strictly = ... }`), ranges, and `[versions]` keys no library or plugin
-references (a compiler version read from build files). All of those are
-listed in the PR body under "Not managed" rather than silently skipped.
+What it deliberately does not manage: plugin versions pinned outside the
+catalog (`id("…") version "…"` in a root build or settings script), rich
+versions (`{ strictly = ... }`), ranges, and `[versions]` keys no library or
+plugin references (a compiler version read from build files). All of those are
+listed in the PR body under "Not managed" rather than silently skipped — the
+out-of-catalog pins by reading the root scripts as text, scoped to the
+interiors of `plugins { … }` blocks, which is where a plugin declaration lives.
+
+**What stays invisible, because the engine never reads it:**
+
+- A **library** coordinate hard-coded in a build file
+  (`implementation("g:a:1.2.3")`).
+- A pin in a module script that `--scan` was not pointed at — including the
+  case where `settings.gradle[.kts]` renames the root build script via
+  `rootProject.buildFileName`, since the default list names the conventional
+  files and the reusable workflow does not forward a `--scan` input.
+- A version applied by **resolution strategy** rather than declared —
+  `pluginManagement { resolutionStrategy { eachPlugin { useVersion("1.2.3") } } }`.
+  Gradle applies it with no `id … version` declaration anywhere, so nothing
+  the scan looks for is present.
+- A **Groovy-only spelling** of a declaration the scan does not model: a bare
+  `id pluginId version "1.2"` whose id is not a literal (the parenthesized
+  `id(pluginId)` form *is* read), or a `plugins({ … })` method-call block.
+  Groovy's optional parentheses and command-expression syntax admit several
+  spellings of the same declaration; modelling them one at a time is the
+  enumeration this scan deliberately stopped doing, and every consumer today is
+  a Kotlin (`.kts`) script.
+
+Each of those is a real way to pin a plugin version this report will not
+mention. None of the consumers uses any of them today; if one starts, the
+honest fix is to teach the scan that shape deliberately rather than to widen
+the pattern until it guesses.
 
 **The transitive gap, honestly:** these repos keep no Gradle lockfile, so a
 same-major direct bump can pull a new *transitive* major with nothing in the

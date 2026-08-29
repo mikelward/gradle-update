@@ -864,6 +864,400 @@ export const updateCatalog = async (
 const moduleNames = (modules) =>
   (modules ?? []).map((m) => `${m.group}:${m.artifact}`).join(", ");
 
+// ---------------------------------------------------------------------------
+// Pins the catalog cannot see.
+// ---------------------------------------------------------------------------
+
+// A Gradle build or settings script can pin a plugin version inline —
+// `id("com.example.thing") version "1.0.0"` — where the catalog never sees it.
+// The engine cannot move such a pin, and until now the consumer got no signal
+// that it had been left behind: exactly the silent skip this tool refuses
+// everywhere else. So the scripts are read as TEXT and every literal pin is
+// reported under "Not managed".
+//
+// Reading, not running. This stays on the safe side of the trust line the
+// two-job split draws (see the header): it is a file read that decides
+// nothing and rewrites nothing, so no dependency or plugin code executes.
+//
+// A raw string is a legal argument too — `id("""x""") version """1.0"""` is
+// valid Kotlin — so the triple forms are tried BEFORE the single character.
+// Matching the first quote of a triple as the whole delimiter reported that
+// pin as `""x""` at version `"`: not noise but a WRONG entry, misnaming a pin
+// the engine can plainly see. Triple quotes now behave the same in both roles
+// they play here — a string whose contents are masked, and a delimiter around
+// an argument.
+//
+// Deliberately narrow — it finds a literal version and nothing else. An
+// `alias(libs.plugins.x)` has no literal to find because the catalog already
+// owns it, and a version built from a variable is not a pin this tool could
+// move anyway. Covers the Kotlin DSL (`id("x") version "y"`), both Groovy
+// spellings (`id 'x' version 'y'`, `id('x').version('y')`), and Gradle's
+// Kotlin-DSL shorthand (`kotlin("jvm") version "y"`), which names the same
+// plugin through a different keyword and would otherwise stay invisible —
+// the failure this scan exists to prevent.
+// One complete string literal, in any spelling Gradle accepts. Written as an
+// alternation of WHOLE literals rather than a lazy run between two
+// delimiters, because a lazy run backtracks across its own closing quote
+// when the rest of the pattern fails to match: `id("java")` followed by
+// `id("com.example.real") version "1.2"` matched from the first `id`, took
+// everything up to the second literal as one corrupted id, and swallowed the
+// real pin with it. A missed pin is the failure this whole scan exists to
+// prevent, so the shape rules it out instead of guarding against it.
+//
+// The single-quoted forms stop at a newline as well as at their delimiter:
+// neither Gradle spelling lets an ordinary literal span lines, so crossing
+// one is always the runaway case, never a real declaration.
+//
+// The triple-quoted forms DO span lines, so a newline cannot bound them — they
+// are bounded by their own closing triple instead, written as "any character
+// that is not a quote, or a quote not beginning one". A lazy run looked
+// equivalent and was not: it backtracks past its own closing delimiter when
+// the rest of the pattern fails, so `id("""java""")` ahead of a real
+// declaration produced one corrupted id spanning both and swallowed the pin —
+// the same runaway this alternation was written to rule out, surviving in the
+// two branches that could still cross themselves.
+const LITERAL = String.raw`(?:"""(?:[^"]|"(?!""))*"""|'''(?:[^']|'(?!''))*'''|"[^"\n]*"|'[^'\n]*')`;
+
+// Strips whichever delimiter a literal actually carries.
+const unquote = (literal) =>
+  literal.startsWith(`"""`) || literal.startsWith(`'''`)
+    ? literal.slice(3, -3)
+    : literal.slice(1, -1);
+
+// The version operand is OPTIONAL, and that is the point: what marks a pin is
+// the `version` keyword, not the shape of what follows it. Gradle accepts a
+// literal, a name (`version pluginVersion`), a catalog accessor, and any other
+// expression down to `.version(["1.2"][0])`; a declaration matched only by the
+// shapes this pattern happened to enumerate produced NO entry at all for the
+// rest, which is the silent skip this scan exists to prevent. Enumerating
+// operand shapes has no more of an end to it than enumerating operators did,
+// so the pattern stops trying: it captures a literal where there is one and
+// reports the plugin with no version where there is not.
+// An id argument that is not a literal. `id(pluginId)` and
+// `id(providers.gradleProperty("suffix").get())` are both declarations Gradle
+// resolves, and requiring a literal here produced NO entry for either — the
+// same silent skip as the version side, one argument over. Balanced to two
+// levels of nesting, which covers a property lookup and its `.get()`; a regex
+// cannot balance arbitrarily, so that limit is stated rather than pretended
+// away.
+//
+// Line breaks are allowed inside it, because a chained call split over several
+// lines is ordinary Kotlin formatting and excluding them silently dropped such
+// a declaration. It still never crosses a `)`, so it cannot run from one
+// declaration into the next.
+const NESTED_ARG = String.raw`(?:[^()]|\((?:[^()]|\([^()]*\))*\))*`;
+
+// The operands on BOTH sides are now shapes this pattern stops enumerating.
+// What marks a pin is the pair of keywords — `id`/`kotlin` and `version` — not
+// what sits between or after them; a literal is captured where there is one so
+// its value can be printed, and anything else reports the pin without that
+// value rather than omitting the pin. Enumerating operand shapes has no more of
+// an end to it than enumerating operators did.
+const PLUGIN_PIN = new RegExp(
+  String.raw`\b(id|kotlin)\s*` +
+    // Parenthesized: a literal, or any other expression.
+    `(?:\\(\\s*(?:(${LITERAL})|(${NESTED_ARG}))\\s*\\)` +
+    // Groovy's bare spelling, `id 'x' version 'y'`, which has no parentheses
+    // and so cannot carry a non-literal argument unambiguously.
+    `|(${LITERAL}))` +
+    String.raw`\s*\.?\s*version\b\s*\(?\s*` +
+    `(${LITERAL})?`,
+  "g",
+);
+
+// A `$` opening a template — `${…}` or `$name`. A real plugin id or version is
+// dotted alphanumerics, so a `$` in one is always interpolation, whichever
+// spelling the literal uses.
+const INTERPOLATION = /\$[{A-Za-z_]/;
+
+// `kotlin("jvm")` is Gradle's shorthand for this prefix plus the argument.
+const KOTLIN_PLUGIN_PREFIX = "org.jetbrains.kotlin.";
+
+// Strips comments so a commented-out pin is never reported as a live one, and
+// records which offsets of the result sit INSIDE a string literal.
+//
+// Both halves are the same problem — knowing what is code and what is not —
+// so they share one pass. Quote-aware stripping is why a naive strip does not
+// cut `uri("https://example.com")` at its `//`; the string mask is why
+// `println('id("com.example.foo") version "1.2.3"')` is not reported as a pin
+// it plainly is not. What matters is the position of the KEYWORD: in a real
+// declaration `id` sits in code and its arguments are the quoted parts, while
+// in that `println` the keyword itself is inside the string.
+//
+// Positions are marked, not blanked, because the arguments a real declaration
+// carries are string literals too — blanking them would leave nothing to
+// match.
+//
+// Quoted, triple-quoted and escaped forms only. Groovy's slashy (`/.../`) and
+// dollar-slashy (`$/.../$`) literals are NOT recognized, deliberately: no
+// consumer is a Groovy build, `/` is ambiguous with division so a rule for it
+// would mis-split ordinary arithmetic, and the cost of the gap is one noise
+// line in a PR body rather than a pin nobody sees. That trade only holds
+// while it stays that way round — a Groovy consumer, or any sign of the gap
+// hiding a real pin, is the reason to revisit it.
+export const scanScript = (text, { nestedBlockComments = false } = {}) => {
+  let out = "";
+  const inString = [];
+  let quote = null;
+  let i = 0;
+  const emit = (chunk, masked) => {
+    out += chunk;
+    for (let k = 0; k < chunk.length; k += 1) inString.push(masked);
+  };
+  const tripleAt = (at) => {
+    const c = text[at];
+    if (c !== '"' && c !== "'") return null;
+    return text[at + 1] === c && text[at + 2] === c ? c.repeat(3) : null;
+  };
+  while (i < text.length) {
+    const c = text[i];
+    if (quote !== null) {
+      // A triple-quoted string is raw: no escapes, and it ends only at its
+      // own closing triple. Handling it as three single quotes flipped the
+      // quote parity whenever the body held an odd number of them, which
+      // marked the REAL code after it as string content and lost the pins in
+      // it -- a missed pin, which this repo ranks as the worse failure.
+      if (quote.length === 3) {
+        if (text.startsWith(quote, i)) {
+          emit(quote, true);
+          i += 3;
+          quote = null;
+          continue;
+        }
+        emit(c, true);
+        i += 1;
+        continue;
+      }
+      if (c === "\\") {
+        emit(c + (text[i + 1] ?? ""), true);
+        i += 2;
+        continue;
+      }
+      if (c === quote) quote = null;
+      emit(c, true);
+      i += 1;
+      continue;
+    }
+    const triple = tripleAt(i);
+    if (triple !== null) {
+      quote = triple;
+      // The opening delimiter is code; what follows it is not.
+      emit(triple, false);
+      i += 3;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      // The opening delimiter is code; what follows it is not.
+      emit(c, false);
+      i += 1;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i += 1;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      i += 2;
+      // Kotlin nests block comments; Groovy and Java do not, closing at the
+      // FIRST `*/`. So the caller says which language this is rather than the
+      // scanner guessing: nesting a Groovy comment would run past its real end
+      // and swallow live code, which costs a missed pin — the worse failure of
+      // the two. Not nesting a Kotlin one leaves the tail of an outer comment
+      // read as code, which costs a spurious line.
+      let depth = 1;
+      while (i < text.length && depth > 0) {
+        if (nestedBlockComments && text[i] === "/" && text[i + 1] === "*") {
+          depth += 1;
+          i += 2;
+          continue;
+        }
+        if (text[i] === "*" && text[i + 1] === "/") {
+          depth -= 1;
+          i += 2;
+          continue;
+        }
+        i += 1;
+      }
+      // A separator, so `a/* c */b` does not become the token `ab`.
+      emit(" ", false);
+      continue;
+    }
+    emit(c, false);
+    i += 1;
+  }
+  return { text: out, inString };
+};
+
+// Kept as its own export because the comment behavior is worth asserting on
+// its own; the mask is what `scanPluginPins` needs.
+export const stripScriptComments = (text, options) => scanScript(text, options).text;
+
+// True when the literal ending at `end` is the WHOLE version expression, not
+// one operand of a larger one. `.version("1." + minor)`, its method spelling
+// `.version("1.".plus(minor))`, and Groovy's `.version("1" * 2)` all report a
+// fragment otherwise — `1.`, `1.`, `1` — each a plain version by the
+// predicate below, so each sails straight through it as if it were pinned.
+//
+// A whitelist of what may FOLLOW a finished literal, not a blacklist of
+// operators: naming operators one at a time (`+`, then `.`, then `*`) is
+// evidence that set has no end. Anything not on this list is an operator
+// continuing the expression, so the version is withheld. Comments are already
+// stripped to a space by scanScript, so they cannot appear here.
+//
+// Words are handled by naming the ones that CANNOT end an expression, not the
+// ones that can, because only the first of those two sets is closed. What may
+// follow a version is `apply`, the next declaration's `id` / `kotlin` /
+// `alias`, or a bare core-plugin accessor — and an accessor is any identifier
+// Gradle publishes (`java`, `application`, `war`, `signing`, …), so listing
+// them was a whitelist that could never be complete, and it reported a real
+// literal version as non-literal the moment one appeared. Word OPERATORS are
+// language keywords, which is a set that does not grow with the DSL: `in`,
+// `is`, `as`, `instanceof`. Naming those and terminating on everything else
+// keeps `.version("1" in [...] ? ... : ...)` from reporting the fragment `1`
+// while letting an accessor end a declaration.
+//
+// A line ending is not a terminator either, and skipping newlines with the
+// rest of the whitespace is the reason: an expression continues across one
+// freely, so `.version("1."` with `+ "2")` on the next line is the version 1.2
+// Gradle resolves. Every real terminator survives the skip — a closing brace
+// or the next declaration's keyword is simply found one line further on.
+const ENDS_EXPRESSION = /[)\]},;]|[A-Za-z_$]/y;
+const WORD_OPERATOR = /(?:in|is|as|instanceof)\b/y;
+
+const isWholeExpression = (code, end) => {
+  let i = end;
+  while (i < code.length && /\s/.test(code[i])) i += 1;
+  // End of file finishes the expression as surely as a bracket does.
+  if (i >= code.length) return true;
+  WORD_OPERATOR.lastIndex = i;
+  if (WORD_OPERATOR.test(code)) return false;
+  ENDS_EXPRESSION.lastIndex = i;
+  return ENDS_EXPRESSION.test(code);
+};
+
+// Every distinct plugin pin in one script, in source order. `version` is null
+// where the declaration does not pin a literal — see below.
+// Every `plugins { … }` block's interior, as [start, end) offsets into the
+// comment-stripped text.
+//
+// This is the context a plugin declaration actually lives in, and scoping the
+// scan to it is what stops the pattern joining two unrelated statements. The
+// operands on both sides are deliberately permissive — that is what stopped
+// the shape enumeration — and the cost was that an ordinary `id(...)` call in
+// one statement and an ordinary `version` in the next could complete a match
+// between them and report a plugin nobody declared. Excluding one spelling at
+// a time (`version =`, then `version.toString()`, …) is the same open-ended
+// enumeration seen from the other end; the block boundary ends the class,
+// because outside a `plugins` block there is no declaration to find.
+//
+// Braces inside string literals do not count, which is why this runs over the
+// mask rather than the raw text. An unclosed block runs to end of file — the
+// permissive direction, since a truncated script should not silently hide the
+// declarations it does contain.
+const pluginBlocks = (code, inString) => {
+  const blocks = [];
+  // `plugins {`. Groovy also accepts `plugins({ … })`, and its bare
+  // `id pluginId version "1.2"` takes a non-literal id the parenthesized form
+  // already handles — both unmodelled, with the reason in README.md: every
+  // consumer is a Kotlin script, and Groovy's optional parentheses admit more
+  // spellings of one declaration than a pattern should chase.
+  const opener = /\bplugins\s*\{/g;
+  for (const match of code.matchAll(opener)) {
+    if (inString[match.index]) continue;
+    let depth = 1;
+    let i = match.index + match[0].length;
+    const start = i;
+    while (i < code.length && depth > 0) {
+      if (!inString[i]) {
+        if (code[i] === "{") depth += 1;
+        else if (code[i] === "}") depth -= 1;
+      }
+      i += 1;
+    }
+    blocks.push([start, depth === 0 ? i - 1 : code.length]);
+  }
+  return blocks;
+};
+
+export const scanPluginPins = (text, options) => {
+  const { text: code, inString } = scanScript(text, options);
+  const blocks = pluginBlocks(code, inString);
+  const pins = [];
+  const seen = new Set();
+  for (const match of code.matchAll(PLUGIN_PIN)) {
+    // A declaration's keyword is code. The same characters inside a string
+    // literal are data — a message, a generated-script template — and
+    // reporting those would put a plugin nobody declared in the weekly PR.
+    if (inString[match.index]) continue;
+    // And it is only a declaration inside a `plugins { … }` block.
+    if (!blocks.some(([from, to]) => match.index >= from && match.index < to)) continue;
+    const keyword = match[1];
+    // Groups 2 and 4 are the literal spellings, 3 the computed one.
+    const idLiteral = match[2] ?? match[4];
+    // A computed id keeps its source text so a reader can find the
+    // declaration, but collapsed onto one line — a chain split over three
+    // lines would otherwise put raw newlines in the middle of a report line.
+    const name =
+      idLiteral === undefined
+        ? match[3].trim().replace(/\s+/g, " ")
+        : unquote(idLiteral);
+    // A declaration with nothing at all between the parentheses is not one.
+    if (idLiteral === undefined && name === "") continue;
+    // An id that is an expression, or a literal carrying a template, resolves
+    // at configuration time — so the source text is not the plugin's id.
+    // Carried on the pin so the reported line can say so: printing it as the
+    // id names a plugin that does not exist, and a wrong entry is worse than a
+    // missing or a spurious one.
+    const computedId = idLiteral === undefined || INTERPOLATION.test(name);
+    const id = keyword === "kotlin" ? KOTLIN_PLUGIN_PREFIX + name : name;
+    // A quoted token is not automatically a pinned version. `version
+    // "$pluginVersion"` is a Kotlin template and `.version("1." + minor)` a
+    // concatenation; reporting either verbatim names a version that is not
+    // pinned anywhere, which is worse than saying nothing about it. Reusing
+    // isPlainVersion is deliberate — it is the same predicate the catalog
+    // path applies to a `[versions]` entry, so both halves of this tool agree
+    // on what counts as a literal.
+    const operand = match[5];
+    const literal = operand === undefined ? null : unquote(operand);
+    const pinned =
+      literal !== null &&
+      isPlainVersion(literal) &&
+      isWholeExpression(code, match.index + match[0].length);
+    // Still reported: the pin is outside the catalog either way, and that is
+    // the fact the section exists to surface. Only the value is withheld.
+    const version = pinned ? literal : null;
+    // The same plugin is routinely pinned once and applied in several blocks;
+    // report the pin, not each mention of it.
+    const key = `${id}\u0000${version ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pins.push({ id, version, computedId });
+  }
+  return pins;
+};
+
+// One "Not managed" line for a pin the scan found outside the catalog.
+//
+// Two things are withheld rather than guessed, and each is withheld because
+// printing it would name something that does not exist — a wrong entry, which
+// this repo ranks below both a missing and a spurious one:
+//
+//   - a version that is not a literal (`version pluginVersion`, `"1." + minor`)
+//   - an id built by interpolation, which resolves at configuration time
+//
+// The pin is reported either way. Being outside the catalog is the fact the
+// section exists to surface, and it is true whether or not the value can be
+// read.
+export const unmanagedPinLine = (pin, file) => {
+  const subject = pin.computedId
+    ? `plugin with a computed id \`${pin.id}\``
+    : `plugin ${pin.id}`;
+  return pin.version === null
+    ? `${subject}: pinned in ${file} with a non-literal version, outside the catalog`
+    : `${subject}: pinned "${pin.version}" in ${file}, outside the catalog`;
+};
+
 export const reportMarkdown = (report) => {
   const lines = [];
   if (report.changes.length > 0) {
@@ -913,13 +1307,38 @@ export const reportMarkdown = (report) => {
 // ---------------------------------------------------------------------------
 
 const parseArgs = (argv) => {
-  const args = { catalog: "gradle/libs.versions.toml", cooldownDays: 5, markdown: null };
+  // The root scripts a plugin version can be pinned in. Module scripts are not
+  // scanned by default — no consumer pins there today, and walking the tree
+  // would read files this tool has no other business in — so `--scan` takes
+  // the whole list when one does.
+  //
+  // Both language variants are listed, and a repository carrying BOTH would
+  // have the ignored one's pins reported alongside the live one's. Not
+  // resolved here on purpose: which variant Gradle selects is a version-
+  // dependent detail, and picking the wrong one turns a spurious line into a
+  // WRONG line naming the file that does not run — the worse failure. A
+  // repository with a stale duplicate root script is already in a state
+  // Gradle itself warns about; `--scan` names the live one explicitly.
+  //
+  // The conventional filenames, which is all a default can be: a settings
+  // script may rename the root build script (`rootProject.buildFileName`), and
+  // resolving that would mean evaluating the settings script — the one thing
+  // the trust split says this side of the line must not do. `--scan` names the
+  // real file where a consumer has renamed it; the limit is in README.md
+  // rather than papered over with a guess.
+  const args = {
+    catalog: "gradle/libs.versions.toml",
+    cooldownDays: 5,
+    markdown: null,
+    scan: ["settings.gradle.kts", "settings.gradle", "build.gradle.kts", "build.gradle"],
+  };
   for (let i = 0; i < argv.length; i++) {
     const [flag, inline] = argv[i].split(/=(.*)/s, 2);
     const value = () => inline ?? argv[++i];
     if (flag === "--catalog") args.catalog = value();
     else if (flag === "--cooldown-days") args.cooldownDays = Number(value());
     else if (flag === "--markdown") args.markdown = value();
+    else if (flag === "--scan") args.scan = value().split(",").filter((f) => f !== "");
     else throw new Error(`unknown argument: ${argv[i]}`);
   }
   if (!Number.isFinite(args.cooldownDays) || args.cooldownDays < 0) {
@@ -968,6 +1387,32 @@ const main = async () => {
   const report = await updateCatalog(text, { fetcher: httpsFetcher, cooldownDays: args.cooldownDays });
 
   if (report.text !== text) writeFileSync(args.catalog, report.text);
+
+  // Plugin versions pinned in a build script instead of the catalog. The
+  // engine cannot move them; naming them is the difference between a gap the
+  // consumer can see and one it cannot. An absent script is not a pin — a
+  // consumer has `settings.gradle.kts` or `settings.gradle`, never both, and
+  // may have no root build script at all.
+  //
+  // This finds DECLARATIONS. A version applied by resolution strategy
+  // (`resolutionStrategy { eachPlugin { useVersion("1.2.3") } }`) pins a plugin
+  // with no declaration anywhere, so nothing here can see it; that is a
+  // separate mechanism to teach the scan deliberately if a consumer adopts one,
+  // not a shape to widen this pattern toward. Recorded in README.md.
+  for (const file of args.scan) {
+    let script;
+    try {
+      script = readFileSync(file, "utf8");
+    } catch (err) {
+      if (err.code === "ENOENT") continue;
+      throw err;
+    }
+    // Only a `.kts` script is Kotlin, and only Kotlin nests block comments.
+    for (const pin of scanPluginPins(script, { nestedBlockComments: file.endsWith(".kts") })) {
+      report.unmanaged.push(unmanagedPinLine(pin, file));
+    }
+  }
+
   const markdown = reportMarkdown(report);
   if (args.markdown !== null) writeFileSync(args.markdown, markdown);
   process.stdout.write(markdown + "\n");
