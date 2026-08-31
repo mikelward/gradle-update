@@ -34,14 +34,18 @@ import { pathToFileURL } from "node:url";
 import {
   REPOSITORIES,
   compareVersions,
+  cooldownWaived,
   fetchModuleVersions,
   fetchVersionDate,
   httpsFetcher,
   isPlainVersion,
   isStable,
   majorOf,
+  parseCoordinates,
+  parseRepositories,
   moduleOf,
   parseCatalog,
+  splitList,
   variantOf,
   versionRefOf,
 } from "./update-versions.mjs";
@@ -183,7 +187,7 @@ export const validateCatalogUpdate = (oldText, newText) => {
 export const verifyUpstream = async (
   newText,
   changes,
-  { fetcher, cooldownDays, now = new Date(), repositories = REPOSITORIES },
+  { fetcher, cooldownDays, now = new Date(), repositories = REPOSITORIES, noCooldownFor = [] },
 ) => {
   const errors = [];
   const { versions, libraries, plugins } = parseCatalog(newText);
@@ -229,7 +233,11 @@ export const verifyUpstream = async (
       // cooldown does not need a date, so a repository that omits
       // Last-Modified (or a transient HEAD failure) must not block an
       // otherwise-valid publish over a check nobody asked for.
-      if (cooldownDays <= 0) continue;
+      // Same waiver the update job applied, re-derived here from the same
+      // declaration rather than taken on trust: without it this job would
+      // reject exactly what that one produced, since a release cut minutes
+      // ago is the normal case for a coordinate whose cooldown was waived.
+      if (cooldownDays <= 0 || cooldownWaived(modules, noCooldownFor)) continue;
       const date = await fetchVersionDate(module, to, repo, fetcher);
       if (date === null) {
         errors.push(`${key}: no publish date for ${coords}:${to}, so the cooldown cannot be verified`);
@@ -256,6 +264,8 @@ const main = async () => {
   let catalog = "gradle/libs.versions.toml";
   let verify = false;
   let cooldownDays = 5;
+  const extraRepositories = [];
+  const noCooldownFor = [];
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
     const [flag, inline] = argv[i].split(/=(.*)/s, 2);
@@ -268,6 +278,8 @@ const main = async () => {
     if (flag === "--catalog") catalog = value();
     else if (flag === "--verify-upstream") verify = true;
     else if (flag === "--cooldown-days") cooldownDays = Number(value());
+    else if (flag === "--extra-repositories") extraRepositories.push(...splitList(value()));
+    else if (flag === "--no-cooldown-for") noCooldownFor.push(...splitList(value()));
     else throw new Error(`unknown argument: ${argv[i]}`);
   }
   if (!Number.isFinite(cooldownDays) || cooldownDays < 0) {
@@ -285,6 +297,8 @@ const main = async () => {
     const upstreamErrors = await verifyUpstream(newText, changes, {
       fetcher: httpsFetcher,
       cooldownDays,
+      repositories: [...REPOSITORIES, ...parseRepositories(extraRepositories)],
+      noCooldownFor: parseCoordinates(noCooldownFor),
     });
     if (upstreamErrors.length > 0) {
       for (const e of upstreamErrors) console.error(`::error::${e}`);

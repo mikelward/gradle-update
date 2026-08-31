@@ -174,6 +174,50 @@ window as the checks; tracked files they modify are diffed into the report
 as the thing the human reviews, then restored — they observe, they never
 publish.
 
+## Depending on a repository you publish yourself
+
+A consumer that publishes its own shared library — and depends on it as a real
+Maven coordinate rather than a composite build — declares where to resolve it
+and exempts it from the release-age cooldown:
+
+```yaml
+    with:
+      extra-repositories: https://raw.githubusercontent.com/mikelward/androidlog/maven
+      no-cooldown-for: com.mikelward.androidlog:logging-android
+```
+
+**`extra-repositories`** is *appended* to Maven Central, Google Maven and the
+Gradle Plugin Portal, never replacing them — a consumer still needs those for
+everything that is not its own. One URL per line, https only: an entry
+reachable over plaintext is where an on-path attacker forges the metadata the
+selection stands on. Declare the same repository in the consumer's own
+`settings.gradle.kts` too, or the batch will select versions Gradle cannot
+resolve. Worth saying plainly: an entry here is trusted for version
+*selection* exactly as much as Maven Central is, and the publish job re-asks
+that same host rather than an independent one.
+
+**`no-cooldown-for`** names exact `group:artifact` coordinates, one per line.
+The cooldown exists so a compromised **third-party** release has time to be
+yanked before an unattended job takes it; against a release you cut yourself
+an hour ago it guards nothing and only adds latency. A key is exempt only when
+**every** coordinate it pins is declared, so a key shared between your own
+artifact and a third-party one keeps the full window. A glob or a malformed
+entry is refused rather than accepted as a literal that then matches nothing —
+silently never matching looks identical to a working configuration. Waived
+keys are named in the PR body under *Taken without the release-age cooldown*,
+so a batch never skips the guard quietly.
+
+Both inputs are read by **both** jobs. A divergence would make the publish job
+reject exactly what the update job produced — fail-closed, but baffling to
+whoever read the PR body — so they are driven from one input each.
+
+One thing to get right on the publishing side: **start at `1.0.0`**. Majors are
+what this tool refuses to cross, and it reads the major as the leading integer
+— so at `0.x` every release you ever cut looks like the same major and is taken
+automatically, including one that breaks the API. `0.x` is by convention the
+phase where breaking changes are allowed, which is exactly where the guard
+would stop working.
+
 ## Testing
 
 ```

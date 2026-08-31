@@ -42,6 +42,31 @@ on:
           has time to be yanked before an unattended job picks it up.
         type: number
         default: 5
+      extra-repositories:
+        description: >-
+          Additional Maven repository URLs to resolve versions from, one per
+          line, https only. APPENDED to Maven Central, Google Maven and the
+          Gradle Plugin Portal — never replacing them, since a consumer still
+          needs those for everything that is not its own. Declare the same
+          repository in the consumer's settings.gradle.kts too, or the batch
+          will select versions Gradle cannot resolve. An entry here is
+          trusted for version selection exactly as much as Maven Central is,
+          and the publish job re-asks the same host rather than an
+          independent one.
+        type: string
+        default: ''
+      no-cooldown-for:
+        description: >-
+          Maven coordinates (group:artifact, one per line) exempt from the
+          release-age cooldown. For a repository you publish yourself the
+          window guards nothing — it exists so a compromised THIRD-PARTY
+          release has time to be yanked — and only adds latency between your
+          release and the batch that takes it. A key is exempt only when
+          EVERY coordinate it pins is declared here, so a shared key spanning
+          your own artifact and a third-party one keeps the full window.
+          Waived keys are named in the PR body rather than moving silently.
+        type: string
+        default: ''
       java-version:
         description: JDK major for the Gradle checks.
         type: string
@@ -217,6 +242,8 @@ jobs:
           # Typed as a number so it cannot carry shell syntax, but env is the
           # discipline every input here travels by — data, never script text.
           COOLDOWN_DAYS: ${{ inputs.cooldown-days }}
+          EXTRA_REPOSITORIES: ${{ inputs.extra-repositories }}
+          NO_COOLDOWN_FOR: ${{ inputs.no-cooldown-for }}
         run: |
           set -euo pipefail
           # Every comparison this workflow makes against the catalog path —
@@ -267,6 +294,8 @@ jobs:
           node .gradle-update/update-versions.mjs \
             --catalog "$CATALOG" \
             --cooldown-days "$COOLDOWN_DAYS" \
+            --extra-repositories "$EXTRA_REPOSITORIES" \
+            --no-cooldown-for "$NO_COOLDOWN_FOR" \
             --markdown report.md
           # The engine has done its work; removing it keeps the tree check
           # below simple and honest.
@@ -1511,10 +1540,17 @@ jobs:
         env:
           CATALOG: ${{ inputs.catalog }}
           COOLDOWN_DAYS: ${{ inputs.cooldown-days }}
+          # Both jobs read the SAME inputs: a divergence would make this job
+          # reject exactly what the update job produced — fail-closed, but
+          # baffling to whoever read the PR body.
+          EXTRA_REPOSITORIES: ${{ inputs.extra-repositories }}
+          NO_COOLDOWN_FOR: ${{ inputs.no-cooldown-for }}
         run: |
           set -euo pipefail
           node .gradle-update/check-gradle-update.mjs \
-            --catalog "$CATALOG" --verify-upstream --cooldown-days "$COOLDOWN_DAYS"
+            --catalog "$CATALOG" --verify-upstream --cooldown-days "$COOLDOWN_DAYS" \
+            --extra-repositories "$EXTRA_REPOSITORIES" \
+            --no-cooldown-for "$NO_COOLDOWN_FOR"
           rm -rf .gradle-update
 
       - name: Stop if the default branch moved while the checks ran
