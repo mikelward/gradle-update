@@ -22,7 +22,10 @@ import {
   decideUpdate,
   rewriteVersions,
   updateCatalog,
+  parseCoordinates,
+  parseRepositories,
   reportMarkdown,
+  splitList,
   httpsFetcher,
   unmanagedPinLine,
 } from "./update-versions.mjs";
@@ -1549,3 +1552,187 @@ test("an unversioned declaration does not swallow the pin after it", () => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// The cooldown waiver and extra repositories.
+//
+// The waiver exists for a repository the consumer publishes itself, where the
+// release-age window guards nothing — it is there so a compromised THIRD-PARTY
+// release has time to be yanked — and only delays the consumer's own artifact.
+// Every case below is behavioral: a false pass here would hand a real batch a
+// guard it no longer has, or waive one nobody declared.
+// ---------------------------------------------------------------------------
+
+const LOCAL_CATALOG = [
+  "[versions]",
+  'androidlog = "1.0.0"',
+  "",
+  "[libraries]",
+  'androidlog = { group = "com.mikelward.androidlog", name = "logging-android", version.ref = "androidlog" }',
+  "",
+].join("\n");
+
+// Published an hour before NOW: inside any cooldown anyone would set.
+const FRESH = "2026-08-14T23:00:00Z";
+const LOCAL_COORD = "com.mikelward.androidlog:logging-android";
+
+const LOCAL_MODULES = {
+  [LOCAL_COORD]: { versions: ["1.0.0", "1.1.0"], dates: { "1.1.0": FRESH } },
+};
+
+test("a declared coordinate takes a release the cooldown would have deferred", async () => {
+  const { report } = await run(LOCAL_CATALOG, LOCAL_MODULES, {
+    noCooldownFor: [LOCAL_COORD],
+  });
+  assert.deepEqual(report.changes.map((c) => [c.key, c.to]), [["androidlog", "1.1.0"]]);
+  // Never silently: the reviewer of the weekly PR has to be able to see that
+  // this key skipped the guard every other key faced.
+  assert.deepEqual(report.waived.map((w) => [w.key, w.to]), [["androidlog", "1.1.0"]]);
+  assert.match(reportMarkdown(report), /Taken without the release-age cooldown/);
+});
+
+test("the same release is deferred when the coordinate is not declared", async () => {
+  // The other half of the pair — without it the test above would pass just as
+  // happily against a build that ignored the cooldown entirely.
+  const { report } = await run(LOCAL_CATALOG, LOCAL_MODULES);
+  assert.deepEqual(report.changes, []);
+  assert.deepEqual(report.waived, []);
+  assert.ok(report.cooldown.some((c) => c.key === "androidlog"));
+});
+
+test("a key shared with an undeclared coordinate keeps the full window", async () => {
+  // Shared keys move together, so waiving on ANY match would hand a
+  // third-party artifact the exemption its sibling was granted.
+  const text = [
+    "[versions]",
+    'shared = "1.0.0"',
+    "",
+    "[libraries]",
+    'mine = { group = "com.mikelward.androidlog", name = "logging-android", version.ref = "shared" }',
+    'theirs = { group = "com.example", name = "other", version.ref = "shared" }',
+    "",
+  ].join("\n");
+  const modules = {
+    [LOCAL_COORD]: { versions: ["1.0.0", "1.1.0"], dates: { "1.1.0": FRESH } },
+    "com.example:other": { versions: ["1.0.0", "1.1.0"], dates: { "1.1.0": FRESH } },
+  };
+  const { report } = await run(text, modules, { noCooldownFor: [LOCAL_COORD] });
+  assert.deepEqual(report.changes, []);
+  assert.deepEqual(report.waived, []);
+});
+
+test("waiving the cooldown does not waive the no-majors rule", async () => {
+  // The waiver is about release AGE only. A major is a deliberate migration
+  // whoever declared the coordinate did not thereby consent to.
+  const modules = {
+    [LOCAL_COORD]: {
+      versions: ["1.0.0", "1.1.0", "2.0.0"],
+      dates: { "1.1.0": FRESH, "2.0.0": FRESH },
+    },
+  };
+  const { report } = await run(LOCAL_CATALOG, modules, {
+    noCooldownFor: [LOCAL_COORD],
+  });
+  assert.deepEqual(report.changes.map((c) => c.to), ["1.1.0"]);
+  assert.deepEqual(report.held.map((h) => [h.key, h.newest]), [["androidlog", "2.0.0"]]);
+});
+
+test("extra repositories are validated, normalized, and https-only", async () => {
+  assert.deepEqual(
+    parseRepositories(splitList("https://example.com/m2/\n\n  https://other.example/m2  \n")),
+    ["https://example.com/m2", "https://other.example/m2"],
+  );
+  // An entry reachable over plaintext is where an on-path attacker forges the
+  // metadata the selection stands on.
+  assert.throws(() => parseRepositories(["http://example.com/m2"]), /must be https/);
+  assert.throws(() => parseRepositories(["not a url"]), /is not a URL/);
+});
+
+test("a repository URL carrying credentials is refused, and not echoed back", async () => {
+  // Node's fetch refuses these anyway, so accepting one buys nothing but the
+  // leak: fetchModuleVersions records the URL it tried verbatim, the run
+  // continues, and reportMarkdown puts that line in the pull request body.
+  assert.throws(
+    () => parseRepositories(["https://user:s3cr3t@example.com/m2"]),
+    /carries credentials in the URL/,
+  );
+  // The token must not survive into the message. Asserted against the SECRET
+  // rather than the whole URL, because a future message could name the host
+  // harmlessly and still leak the part that matters.
+  try {
+    parseRepositories(["https://user:s3cr3t@example.com/m2"]);
+    assert.fail("a credential-bearing URL must be refused");
+  } catch (e) {
+    assert.ok(!e.message.includes("s3cr3t"), `the error echoed the secret: ${e.message}`);
+    assert.ok(!e.message.includes("user:"), `the error echoed the userinfo: ${e.message}`);
+  }
+  // Neither does any other refusal here: an entry that fails to parse at all
+  // could still be a URL with a typo somewhere after the token.
+  try {
+    parseRepositories(["ht!tp://user:s3cr3t@example.com/m2"]);
+    assert.fail("an unparseable entry must be refused");
+  } catch (e) {
+    assert.ok(!e.message.includes("s3cr3t"), `the error echoed the secret: ${e.message}`);
+  }
+  // The positive direction: an ordinary URL is still accepted unchanged.
+  assert.deepEqual(parseRepositories(["https://example.com/m2"]), ["https://example.com/m2"]);
+});
+
+test("a repository URL with a query or fragment is refused", async () => {
+  // The Maven path is appended to this string, so `.../m2?token=x` puts the
+  // metadata path inside the query and a fragment drops it entirely. Every
+  // lookup then fails while the configuration looks valid.
+  assert.throws(() => parseRepositories(["https://example.com/m2?token=x"]), /query string/);
+  assert.throws(() => parseRepositories(["https://example.com/m2#frag"]), /fragment/);
+  // A query is not echoed either -- `?token=` is a plausible place to find one.
+  try {
+    parseRepositories(["https://example.com/m2?token=s3cr3t"]);
+    assert.fail("a query string must be refused");
+  } catch (e) {
+    assert.ok(!e.message.includes("s3cr3t"), `the error echoed the query: ${e.message}`);
+  }
+  // A path that merely LOOKS like it has one is fine: `?` and `#` are the
+  // parsed components, not a substring match.
+  assert.deepEqual(
+    parseRepositories(["https://example.com/m2/some-group%3Fnot-a-query"]),
+    ["https://example.com/m2/some-group%3Fnot-a-query"],
+  );
+});
+
+test("a waiver names one exact coordinate, and a typo is refused not ignored", async () => {
+  assert.deepEqual(parseCoordinates(splitList("a.b:c\n\nd.e:f\n")), ["a.b:c", "d.e:f"]);
+  // Silently never matching would look identical to a working configuration.
+  assert.throws(() => parseCoordinates(["com.mikelward.androidlog"]), /group:artifact/);
+  assert.throws(() => parseCoordinates(["a.b:c:d"]), /group:artifact/);
+  assert.throws(() => parseCoordinates(["com.mikelward.*:*"]), /group:artifact/);
+});
+
+test("a waiver coordinate that matches no catalog entry is reported", async () => {
+  // The shape check above passes `logging-andriod` -- it is a well-formed
+  // coordinate, just not one this catalog pins. Nothing further would match
+  // it, so the caller would believe its releases were exempt while every one
+  // of them kept being deferred, with no diagnostic anywhere (Codex, PR #28).
+  const { report } = await run(LOCAL_CATALOG, LOCAL_MODULES, {
+    noCooldownFor: ["com.mikelward.androidlog:logging-andriod"],
+  });
+  assert.ok(
+    report.unmanaged.some((u) => u.includes("logging-andriod")),
+    `the unmatched waiver was not reported: ${JSON.stringify(report.unmanaged)}`,
+  );
+  assert.match(reportMarkdown(report), /logging-andriod/);
+  // Reported, not fatal, and it waives nothing: the real coordinate was never
+  // declared, so the release it names is still deferred.
+  assert.deepEqual(report.waived, []);
+  assert.deepEqual(report.changes, []);
+});
+
+test("a waiver coordinate that does match is not reported as unmatched", async () => {
+  // The negative half. Without it the assertion above would pass just as
+  // happily against a build that reported EVERY declared coordinate.
+  const { report } = await run(LOCAL_CATALOG, LOCAL_MODULES, {
+    noCooldownFor: [LOCAL_COORD],
+  });
+  assert.deepEqual(
+    report.unmanaged.filter((u) => u.startsWith("no-cooldown-for")),
+    [],
+  );
+});

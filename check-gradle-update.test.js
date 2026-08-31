@@ -370,3 +370,73 @@ test("verifyUpstream holds a shared key until every module lists the version", a
   assert.equal(errors.length, 1);
   assert.match(errors[0], /lifecycle-viewmodel-compose/);
 });
+
+// ---------------------------------------------------------------------------
+// The cooldown waiver, from the publish job's side.
+//
+// The update job waives the window for declared coordinates; this job re-derives
+// the same waiver from the same declaration rather than taking it on trust. If
+// it did not, this job would reject exactly what the other one produced — a
+// release cut minutes ago being the normal case for a coordinate whose cooldown
+// was waived on purpose.
+// ---------------------------------------------------------------------------
+
+const LOCAL = "com.mikelward.androidlog:logging-android";
+
+const LOCAL_CATALOG = [
+  "[versions]",
+  'androidlog = "1.0.0"',
+  "",
+  "[libraries]",
+  'androidlog = { group = "com.mikelward.androidlog", name = "logging-android", version.ref = "androidlog" }',
+  "",
+].join("\n");
+
+const LOCAL_BUMPED = LOCAL_CATALOG.replace('androidlog = "1.0.0"', 'androidlog = "1.1.0"');
+const LOCAL_CHANGE = [{ key: "androidlog", from: "1.0.0", to: "1.1.0" }];
+
+const verifyLocal = (modules, noCooldownFor) =>
+  verifyUpstream(LOCAL_BUMPED, LOCAL_CHANGE, {
+    fetcher: makeFetcher(modules),
+    cooldownDays: 5,
+    now: NOW,
+    repositories: [REPO],
+    noCooldownFor,
+  });
+
+test("verifyUpstream accepts a fresh release for a declared coordinate", async () => {
+  const errors = await verifyLocal(
+    { [LOCAL]: { versions: ["1.0.0", "1.1.0"], dates: { "1.1.0": FRESH } } },
+    [LOCAL],
+  );
+  assert.deepEqual(errors, []);
+});
+
+test("verifyUpstream still refuses that release when nothing declared it", async () => {
+  // The pair: without this, the test above would pass against a build that had
+  // simply stopped checking the cooldown at all.
+  const errors = await verifyLocal(
+    { [LOCAL]: { versions: ["1.0.0", "1.1.0"], dates: { "1.1.0": FRESH } } },
+    [],
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /inside the 5-day cooldown/);
+});
+
+test("a waived coordinate still has to exist upstream", async () => {
+  // The waiver is about AGE. Existence is what stops a forged catalog edit,
+  // and no declaration may buy an exemption from that.
+  const errors = await verifyLocal({ [LOCAL]: { versions: ["1.0.0"], dates: {} } }, [LOCAL]);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /no repository lists/);
+});
+
+test("a waived coordinate needs no publish date at all", async () => {
+  // A repository that serves no Last-Modified (raw.githubusercontent among
+  // them) would otherwise fail the date check on every publish.
+  const errors = await verifyLocal(
+    { [LOCAL]: { versions: ["1.0.0", "1.1.0"], dates: {} } },
+    [LOCAL],
+  );
+  assert.deepEqual(errors, []);
+});

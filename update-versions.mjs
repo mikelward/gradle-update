@@ -620,6 +620,19 @@ export const fetchVersionDate = async (module, version, repo, fetcher) => {
   }
 };
 
+// Whether a key's cooldown is waived by configuration. EVERY module the key
+// pins has to be declared: a key shared between a local coordinate and a
+// third-party one still faces the full window, because the window exists for
+// the third-party half and a shared key moves as one. Exact `group:artifact`
+// records, never a prefix or a glob — a declared coordinate is data, and
+// matching it loosely is how a typo silently waives the guard for something
+// nobody meant to name.
+export const cooldownWaived = (modules, noCooldownFor) => {
+  if (noCooldownFor.length === 0) return false;
+  const declared = new Set(noCooldownFor);
+  return modules.every((m) => declared.has(`${m.group}:${m.artifact}`));
+};
+
 // ---------------------------------------------------------------------------
 // The decision: one version key at a time.
 // ---------------------------------------------------------------------------
@@ -749,7 +762,7 @@ export const rewriteVersions = (text, changes) => {
 // — that lands in report.errors, and the CLI decides how loud to be.
 export const updateCatalog = async (
   text,
-  { fetcher, now = new Date(), cooldownDays = 5, repositories = REPOSITORIES },
+  { fetcher, now = new Date(), cooldownDays = 5, repositories = REPOSITORIES, noCooldownFor = [] },
 ) => {
   const { versions, libraries, plugins } = parseCatalog(text);
 
@@ -780,9 +793,28 @@ export const updateCatalog = async (
     // No version at all (BOM-managed library): nothing to manage, not a gap.
   }
 
+  // A waiver coordinate is checked for SHAPE when it is parsed; nothing until
+  // here checks that it names anything. `logging-andriod` passes the parser,
+  // matches no module, and then every release of the real coordinate is
+  // deferred by a cooldown the caller believes it waived -- with no diagnostic
+  // anywhere, which is exactly the silent-never-matching failure the parser's
+  // own comment claims to have closed (Codex, PR #28). Reported rather than
+  // fatal, matching how every other thing this tool can see but is not acting
+  // on is handled: a coordinate declared before its dependency is added is a
+  // legitimate state, and failing the batch over it would be worse.
+  const declaredModules = new Set(
+    [...modulesByKey.values()].flat().map((m) => `${m.group}:${m.artifact}`),
+  );
+  for (const coordinate of noCooldownFor) {
+    if (!declaredModules.has(coordinate)) {
+      unmanaged.push(`no-cooldown-for "${coordinate}": no catalog entry pins it`);
+    }
+  }
+
   const changes = [];
   const held = [];
   const cooldown = [];
+  const waived = [];
   const errors = [];
   for (const [key, { value, quote, line }] of versions) {
     const modules = modulesByKey.get(key);
@@ -820,13 +852,17 @@ export const updateCatalog = async (
     }
     if (failed) continue;
 
+    // decideUpdate already short-circuits on a non-positive window, so a
+    // waived key needs nothing of its own here — it is the same code path a
+    // consumer running `cooldown-days: 0` takes, scoped to one key.
+    const waivedHere = cooldownWaived(modules, noCooldownFor);
     const decision = await decideUpdate(
       key,
       value,
       modules,
       availableByModule.map((v) => ({ versions: v })),
       {
-        cooldownDays,
+        cooldownDays: waivedHere ? 0 : cooldownDays,
         now,
         versionDate: (module, version, repo) =>
           fetchVersionDate(module, version, repo, fetcher),
@@ -834,6 +870,9 @@ export const updateCatalog = async (
     );
     if (decision.to !== null) {
       changes.push({ key, from: value, to: decision.to, line, quote, modules });
+      // Said aloud rather than assumed: a reviewer reading the PR has to be
+      // able to see that this key skipped the guard every other key faced.
+      if (waivedHere) waived.push({ key, to: decision.to, modules });
     }
     if (decision.heldMajor !== null) {
       held.push({ key, from: value, newest: decision.heldMajor, modules });
@@ -851,6 +890,7 @@ export const updateCatalog = async (
     changes,
     held,
     cooldown,
+    waived,
     unmanaged,
     errors,
   };
@@ -1288,6 +1328,15 @@ export const reportMarkdown = (report) => {
     }
     lines.push("");
   }
+  if ((report.waived ?? []).length > 0) {
+    lines.push("## Taken without the release-age cooldown", "");
+    for (const w of report.waived) {
+      lines.push(
+        `- \`${w.key}\` (${moduleNames(w.modules)}): took ${w.to} immediately — declared local, cooldown waived`,
+      );
+    }
+    lines.push("");
+  }
   if (report.unmanaged.length > 0) {
     lines.push("## Not managed by this tool", "");
     for (const u of report.unmanaged) lines.push(`- ${u}`);
@@ -1305,6 +1354,85 @@ export const reportMarkdown = (report) => {
 // ---------------------------------------------------------------------------
 // CLI.
 // ---------------------------------------------------------------------------
+
+// A workflow input arrives as one multi-line string, so every list-valued
+// flag accepts newlines AND repetition, and drops blank lines. Exported for
+// the tests: the parsing is where a consumer's declaration either survives
+// intact or quietly becomes something else.
+export const splitList = (value) =>
+  String(value)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+// An extra repository is trusted for version SELECTION exactly as much as
+// Maven Central is, and the publish job re-asks the same host rather than an
+// independent one — so it has to be https, and it has to be the consumer's
+// own deliberate declaration. A trailing slash is stripped because every
+// caller builds `${repo}/${groupPath(...)}` and `//` is not the same path on
+// every server.
+export const parseRepositories = (values) =>
+  values.map((raw, index) => {
+    // No error here echoes the entry, and that is the point rather than
+    // terseness. A repository URL is the one input to this tool that can carry
+    // a secret, every error below TRAVELS -- the run continues, the message
+    // lands in report.md, and the workflow copies that into the pull request
+    // body -- and the failure is silent, because a token in a public PR body
+    // reads as an ordinary diagnostic. So the position is named instead; a
+    // reader has the value in their own workflow file (Codex, PR #28).
+    const where = `--extra-repositories entry ${index + 1}`;
+    const url = raw.replace(/\/+$/, "");
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`${where} is not a URL`);
+    }
+    if (parsed.protocol !== "https:") {
+      // An entry reachable over plaintext is where an on-path attacker forges
+      // the metadata the selection stands on. The scheme is safe to name: it
+      // is the part that is wrong, and it carries nothing.
+      throw new Error(`${where} must be https, not ${parsed.protocol.replace(":", "")}`);
+    }
+    if (parsed.username !== "" || parsed.password !== "") {
+      // Refused rather than passed through, and refused HERE so no such URL
+      // ever reaches fetchModuleVersions, which records the URL it tried
+      // verbatim in an error. Node's fetch rejects a credential-bearing URL
+      // anyway, so the only thing accepting one buys is the leak.
+      throw new Error(
+        `${where} carries credentials in the URL. Node's fetch refuses those, and the ` +
+          `failure would be reported with the URL in it -- publish the token through a ` +
+          `masked channel instead of the repository address.`,
+      );
+    }
+    if (parsed.search !== "" || parsed.hash !== "") {
+      // The Maven path is appended to this string, so a query would land the
+      // metadata path inside the query and a fragment would drop it entirely.
+      // Every lookup then fails while the configuration looks valid -- the
+      // shape of failure this whole function exists to refuse (Codex, PR #28).
+      throw new Error(
+        `${where} carries a ${parsed.search !== "" ? "query string" : "fragment"}, and the ` +
+          `Maven path is appended after it -- every lookup would fail while the ` +
+          `configuration looked valid.`,
+      );
+    }
+    return url;
+  });
+
+// A waiver names one exact `group:artifact`. Rejecting anything else here
+// keeps a typo from being read as a coordinate that simply never matches,
+// which would look identical to a working configuration.
+export const parseCoordinates = (values) =>
+  values.map((raw) => {
+    // Restricted to what a Maven groupId/artifactId can actually contain, so
+    // a glob (`com.example.*:*`) is refused rather than accepted as a literal
+    // that then matches nothing — silently never matching looks identical to
+    // a working configuration, which is the failure this check exists for.
+    if (!/^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/.test(raw)) {
+      throw new Error(`--no-cooldown-for entry must be group:artifact: ${raw}`);
+    }
+    return raw;
+  });
 
 const parseArgs = (argv) => {
   // The root scripts a plugin version can be pinned in. Module scripts are not
@@ -1331,6 +1459,8 @@ const parseArgs = (argv) => {
     cooldownDays: 5,
     markdown: null,
     scan: ["settings.gradle.kts", "settings.gradle", "build.gradle.kts", "build.gradle"],
+    extraRepositories: [],
+    noCooldownFor: [],
   };
   for (let i = 0; i < argv.length; i++) {
     const [flag, inline] = argv[i].split(/=(.*)/s, 2);
@@ -1339,11 +1469,15 @@ const parseArgs = (argv) => {
     else if (flag === "--cooldown-days") args.cooldownDays = Number(value());
     else if (flag === "--markdown") args.markdown = value();
     else if (flag === "--scan") args.scan = value().split(",").filter((f) => f !== "");
+    else if (flag === "--extra-repositories") args.extraRepositories.push(...splitList(value()));
+    else if (flag === "--no-cooldown-for") args.noCooldownFor.push(...splitList(value()));
     else throw new Error(`unknown argument: ${argv[i]}`);
   }
   if (!Number.isFinite(args.cooldownDays) || args.cooldownDays < 0) {
     throw new Error(`--cooldown-days must be a non-negative number`);
   }
+  args.extraRepositories = parseRepositories(args.extraRepositories);
+  args.noCooldownFor = parseCoordinates(args.noCooldownFor);
   return args;
 };
 
@@ -1384,7 +1518,14 @@ export const httpsFetcher = async (url, init) => {
 const main = async () => {
   const args = parseArgs(process.argv.slice(2));
   const text = readFileSync(args.catalog, "utf8");
-  const report = await updateCatalog(text, { fetcher: httpsFetcher, cooldownDays: args.cooldownDays });
+  const report = await updateCatalog(text, {
+    fetcher: httpsFetcher,
+    cooldownDays: args.cooldownDays,
+    // Appended, never replacing: a consumer still needs Central and Google
+    // for everything that is not its own.
+    repositories: [...REPOSITORIES, ...args.extraRepositories],
+    noCooldownFor: args.noCooldownFor,
+  });
 
   if (report.text !== text) writeFileSync(args.catalog, report.text);
 
