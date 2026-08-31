@@ -882,3 +882,36 @@ test("a non-empty commit-prefix still ships with exactly one separating space", 
     "deps: Update dependencies (2026-08-22) — CHECKS FAILING",
   );
 });
+
+test("both jobs read the same extra-repositories and no-cooldown-for inputs", () => {
+  // The publish job re-derives the waiver and re-asks the repositories from
+  // its own clean context. If the two jobs were ever wired to different
+  // inputs, this one would reject exactly what the other produced — a
+  // release inside the window, or a version from a repository it was never
+  // told about. Fail-closed, so nothing unsafe ships, but the failure lands
+  // on a batch whose PR body says every check passed, which is the kind of
+  // contradiction nobody debugs quickly. Enforced here because a comment
+  // saying "both jobs read the same inputs" cannot fail when it stops
+  // being true.
+  for (const input of ["extra-repositories", "no-cooldown-for"]) {
+    const env = new RegExp(`\\\$\\{\\{ inputs\\.${input} \\}\\}`, "g");
+    const uses = [...workflow.matchAll(env)];
+    assert.equal(
+      uses.length,
+      2,
+      `inputs.${input} must be read exactly twice — once per job — found ${uses.length}`,
+    );
+  }
+  // And each script actually receives them, rather than the env var being
+  // set and then never passed on.
+  assert.match(
+    workflow,
+    /--extra-repositories "\$EXTRA_REPOSITORIES" \\\n\s*--no-cooldown-for "\$NO_COOLDOWN_FOR" \\/,
+    "update-versions.mjs must receive both flags",
+  );
+  assert.match(
+    workflow,
+    /--extra-repositories "\$EXTRA_REPOSITORIES" \\\n\s*--no-cooldown-for "\$NO_COOLDOWN_FOR"$/m,
+    "check-gradle-update.mjs must receive both flags",
+  );
+});
