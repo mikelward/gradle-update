@@ -63,6 +63,23 @@ commit reachable from this repository — a fork's pull request head
 included. The pin also means a consumer piloting `@branch` runs that
 branch's engine rather than main's.
 
+**The batch credential lives in an environment only the publish job
+declares.** A secret passed through `workflow_call` reaches the runner of
+every job in the called workflow, the update job included — a runner holds a
+job's whole secrets context for log masking whether or not a step references
+it — so "the credential lives only in the publish job" was never what the
+platform delivered. An environment secret reaches only the job that declares
+the environment. So publish declares `inputs.environment` (default
+`gradle-update`), the update job never declares one, the caller passes
+`secrets: inherit`, and `GRADLE_UPDATE_PAT` (or the `GRADLE_UPDATE_APP_*` pair)
+is set on that environment rather than on the repository —
+`repo secrets --env gradle-update` in mikelward/repo does exactly that. The
+explicit `secrets:` block is the legacy route and still works. The cost
+`inherit` carries is that every OTHER repository-level secret of the
+consumer now reaches the update job too, which is why mikelward/repo's
+`repo audit` reports repository-level secrets: a consumer running this batch
+keeps its secrets environment-scoped.
+
 ## What this repository must not grow
 
 - **No dependencies. No `package.json`, no lockfile, no build step.** What a
