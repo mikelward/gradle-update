@@ -191,7 +191,6 @@ jobs:
       regen_mode: ${{ steps.regen.outputs.files_mode }}
       base: ${{ steps.base.outputs.sha }}
       catalog_sha: ${{ steps.changed.outputs.catalog_sha }}
-      engine_sha: ${{ steps.engine.outputs.sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -212,23 +211,23 @@ jobs:
         id: base
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # The engine, from this repository at main — the same convention as
-      # consuming the workflow itself at @main: no build step, no
-      # dependencies, the file that runs is the file you can read there.
+      # The engine, from this repository at the exact revision of the
+      # workflow that is running — `job.workflow_sha` — never a moving ref.
+      # That is the commit the caller's `uses:` resolved, whichever ref it
+      # named, so a consumer piloting a branch runs THAT branch's engine
+      # rather than main's, and the publish job pins the validator to the
+      # same revision below without this job having to report which one it
+      # used. It used to: the sha traveled as a job output, and a job output
+      # is something this untrusted job writes — a forged one would have
+      # pointed publish, with the write credential in its env, at any commit
+      # reachable from this repository, a fork's pull request head included.
       - name: Fetch the update engine
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           repository: mikelward/gradle-update
-          ref: main
+          ref: ${{ job.workflow_sha }}
           path: .gradle-update
           persist-credentials: false
-
-      # One immutable revision for the whole run: the publish job checks the
-      # validator out at THIS sha, so main advancing mid-run cannot validate
-      # the batch under different rules than resolved it.
-      - name: Record the engine revision
-        id: engine
-        run: echo "sha=$(git -C .gradle-update rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # Reads Maven metadata over HTTPS and rewrites [versions] in place.
       # No dependency code executes here — that starts with the Gradle
@@ -1519,9 +1518,12 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           repository: mikelward/gradle-update
-          # The exact revision the update job resolved with — never a moving
-          # ref, so the batch is validated under the same rules that made it.
-          ref: ${{ needs.update.outputs.engine_sha }}
+          # The same pin the update job used — the revision of the workflow
+          # that is running, read from the runner's own context rather than
+          # from anything the update job reported. The batch is validated
+          # under the rules that resolved it, and nothing the untrusted job
+          # writes can choose what code runs here.
+          ref: ${{ job.workflow_sha }}
           path: .gradle-update
           persist-credentials: false
 
