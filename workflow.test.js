@@ -67,7 +67,25 @@ test("both jobs fetch the engine at the running workflow's own revision, never a
 
 test("the token secret is declared optional and read into env.PAT", () => {
   assert.match(workflow, /^\s*token:\s*$/m, "the reusable workflow must declare a token secret");
-  assert.match(workflow, /PAT: \$\{\{ secrets\.token \}\}/, "the publish job must read secrets.token into env.PAT");
+  assert.match(workflow, /PAT: \$\{\{ secrets\.GRADLE_UPDATE_PAT \|\| secrets\.token \}\}/, "the publish job must read the environment's GRADLE_UPDATE_PAT into env.PAT, falling back to the legacy secrets.token");
+  assert.match(workflow, /APP_ID: \$\{\{ secrets\.GRADLE_UPDATE_APP_ID \|\| secrets\.app-id \}\}/, "APP_ID must prefer the environment's GRADLE_UPDATE_APP_ID");
+  assert.match(workflow, /APP_PRIVATE_KEY: \$\{\{ secrets\.GRADLE_UPDATE_APP_PRIVATE_KEY \|\| secrets\.app-private-key \}\}/, "APP_PRIVATE_KEY must prefer the environment's GRADLE_UPDATE_APP_PRIVATE_KEY");
+});
+
+test("only the publish job declares the environment the batch credential lives in", () => {
+  // A secret passed through workflow_call reaches the runner of every job
+  // in the called workflow, the update job included — where dependency
+  // code runs with sudo. An environment secret reaches only the job that
+  // declares the environment, so publish declares it, from the input, and
+  // update never does.
+  assert.match(workflow, /^      environment:\n        description: >-[^]*?\n        type: string\n        default: gradle-update\n/m, "the environment input, defaulting to gradle-update, was not found");
+  const environments = [...workflow.matchAll(/^    environment: (.*)$/gm)].map((m) => m[1]);
+  assert.deepEqual(environments, ["${{ inputs.environment }}"], `exactly one job may declare an environment, from the input; found ${JSON.stringify(environments)}`);
+  const updateStart = workflow.indexOf("\n  update:\n");
+  const publishStart = workflow.indexOf("\n  publish:\n");
+  assert.ok(updateStart > -1 && publishStart > updateStart, "expected the update job to precede the publish job");
+  assert.doesNotMatch(workflow.slice(updateStart, publishStart), /^\s*environment:/m, "the update job must never declare an environment");
+  assert.match(workflow.slice(publishStart), /^    environment: \$\{\{ inputs\.environment \}\}$/m, "the publish job must declare the environment from the input");
 });
 
 test("the Actions-API run-timestamp read stays on github.token, never the App-preferring GH_TOKEN", () => {

@@ -34,9 +34,17 @@ single-owner.
      GitHub does not offer a non-expiring fine-grained token. Renewing means
      generating a new token and updating the secret below in every
      repository it covers.
-2. **Add one secret to each consumer repository** (Settings → Secrets and
-   variables → Actions → New repository secret): `GRADLE_UPDATE_PAT` — the
-   token value. Named per-hub, matching `docs/GITHUB_APP.md`'s convention,
+2. **Add one secret to each consumer repository's `gradle-update` environment**
+   (Settings → Environments → `gradle-update` → Environment secrets; or, from
+   mikelward/repo, `repo secrets --name GRADLE_UPDATE_PAT --env gradle-update
+   --file token.txt OWNER/REPO...`, which creates the environment when it is
+   missing): `GRADLE_UPDATE_PAT` — the token value. An environment secret, not a
+   repository secret, on purpose: a repository secret passed to a reusable
+   workflow reaches the runner of every job in it, the update job included,
+   where plugin and dependency code runs with sudo, while an
+   environment secret reaches only the job that declares the environment,
+   and only the publish job does. A repository-level `GRADLE_UPDATE_PAT` left
+   over from before is deleted once the environment one is set. Named per-hub, matching `docs/GITHUB_APP.md`'s convention,
    even though the same token value can cover a repository that also runs
    `rust-update`'s `RUST_UPDATE_PAT` — each consumer's secrets are
    independent (no account-wide secret store on a personal account), and a
@@ -45,8 +53,9 @@ single-owner.
 
 ## What the consumer's caller workflow passes
 
-`gradle-update.yml` accepts this as a `secrets:` block on `workflow_call`. A
-consumer opts in by passing it through:
+The publish job reads `GRADLE_UPDATE_PAT` from the `gradle-update` environment when the
+caller passes `secrets: inherit` — the only way an environment secret can reach
+a called workflow. A consumer opts in like this:
 
 ```yaml
 jobs:
@@ -56,16 +65,20 @@ jobs:
       contents: write
       pull-requests: write
       actions: write
-    secrets:
-      token: ${{ secrets.GRADLE_UPDATE_PAT }}
+    # `inherit`, not a `secrets:` block naming the token: an environment
+    # secret reaches a called workflow no other way. zizmor flags this
+    # (secrets-inherit); allow it for this file in .github/zizmor.yml, with
+    # this reason. The older `secrets: token: ...` block still works but
+    # delivers the token to every job's runner.
+    secrets: inherit
     with:
       # ...existing inputs...
 ```
 
-Optional on the reusable workflow's side, like `app-id`/`app-private-key`: a
-consumer that sets none of the three keeps today's `github.token` behavior
-and the approval prompt on its first bot-opened pull request. If both a
-token and `app-id`/`app-private-key` are supplied, the token wins.
+Optional on the reusable workflow's side, like the App pair: a consumer whose
+environment holds none of them keeps today's `github.token` behavior and the
+approval prompt on its first bot-opened pull request. If both `GRADLE_UPDATE_PAT` and
+the `GRADLE_UPDATE_APP_*` pair are present, the token wins.
 
 ## What changes for you, once wired
 

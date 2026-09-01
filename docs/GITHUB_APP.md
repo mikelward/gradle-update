@@ -48,8 +48,17 @@ for the registration steps, then:
    → Install App → pick the account → select repositories explicitly rather
    than "All repositories", so adding a new repository to the account never
    silently grants this App access to it).
-2. **Add two secrets to each consumer repository** (Settings → Secrets and
-   variables → Actions → New repository secret):
+2. **Add two secrets to each consumer repository's `gradle-update` environment**
+   (Settings → Environments → `gradle-update` → Environment secrets; or, from
+   mikelward/repo, `repo secrets --name NAME --env gradle-update --file PATH
+   OWNER/REPO...` once per secret, which creates the environment when it is
+   missing) — repeated per repository because a personal GitHub account has
+   no account-wide secret store the way an organization does, and as
+   environment rather than repository secrets on purpose: a repository secret
+   passed to a reusable workflow reaches the runner of every job in it, the
+   update job included, where plugin and dependency code runs with sudo,
+   while an environment secret reaches only the job that declares the
+   environment, and only the publish job does:
    - `GRADLE_UPDATE_APP_ID` — the App ID.
    - `GRADLE_UPDATE_APP_PRIVATE_KEY` — the full contents of the App's `.pem`
      private key file, unmodified (`-----BEGIN RSA PRIVATE KEY-----` line and
@@ -64,8 +73,9 @@ for the registration steps, then:
 
 ## What the consumer's caller workflow passes
 
-`gradle-update.yml` accepts these as a `secrets:` block on `workflow_call`. A
-consumer opts in by passing them through:
+The publish job reads both from the `gradle-update` environment when the caller
+passes `secrets: inherit` — the only way an environment secret can reach a
+called workflow. A consumer opts in like this:
 
 ```yaml
 jobs:
@@ -75,9 +85,12 @@ jobs:
       contents: write
       pull-requests: write
       actions: write
-    secrets:
-      app-id: ${{ secrets.GRADLE_UPDATE_APP_ID }}
-      app-private-key: ${{ secrets.GRADLE_UPDATE_APP_PRIVATE_KEY }}
+    # `inherit`, not a `secrets:` block naming the pair: an environment
+    # secret reaches a called workflow no other way. zizmor flags this
+    # (secrets-inherit); allow it for this file in .github/zizmor.yml, with
+    # this reason. The older `secrets: app-id: ...` block still works but
+    # delivers the key to every job's runner.
+    secrets: inherit
     with:
       # ...existing inputs...
 ```

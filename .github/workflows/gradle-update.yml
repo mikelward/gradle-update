@@ -137,6 +137,26 @@ on:
           dispatch.
         type: string
         default: android-ci.yml
+      environment:
+        description: >-
+          The deployment environment the publish job runs in, and so the
+          environment whose secrets it can read. The batch credential —
+          GRADLE_UPDATE_PAT, or GRADLE_UPDATE_APP_ID plus
+          GRADLE_UPDATE_APP_PRIVATE_KEY — belongs there, not among the
+          repository's secrets: a repository secret passed to this workflow
+          reaches the runner of EVERY job in it, the update job included,
+          where plugin and dependency code runs with sudo, while an
+          environment secret reaches only the job that declares the
+          environment, and the update job never does. Pair it with
+          `secrets: inherit` on the caller; see docs/PAT.md.
+        type: string
+        default: gradle-update
+    # Passing a secret through this block is the LEGACY route — see the
+    # `environment` input above: a secret handed to the workflow this way
+    # reaches every job's runner, the untrusted update job included. Kept so
+    # a caller written before the environment existed keeps working; the
+    # publish job prefers the environment-scoped, hub-named secret whenever
+    # the caller passes `secrets: inherit`, and falls back to these.
     secrets:
       app-id:
         description: >-
@@ -1318,6 +1338,10 @@ jobs:
     if: needs.update.outputs.changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The environment whose secrets this job may read — see the
+    # `environment` input. Only this job declares it, so an environment-
+    # scoped credential is never delivered to the update job's runner.
+    environment: ${{ inputs.environment }}
     permissions:
       # This block scopes only the job's own auto-generated GITHUB_TOKEN.
       # When a consumer supplies app-id/app-private-key below, the token
@@ -1338,9 +1362,12 @@ jobs:
     # workflow_call secrets, so an if: naming them outright would just
     # never select the intended branch.
     env:
-      APP_ID: ${{ secrets.app-id }}
-      APP_PRIVATE_KEY: ${{ secrets.app-private-key }}
-      PAT: ${{ secrets.token }}
+      # The hub-named secret first — what `secrets: inherit` delivers from
+      # the environment above (or, until it is moved there, from the
+      # repository) — then the legacy explicitly-passed one.
+      APP_ID: ${{ secrets.GRADLE_UPDATE_APP_ID || secrets.app-id }}
+      APP_PRIVATE_KEY: ${{ secrets.GRADLE_UPDATE_APP_PRIVATE_KEY || secrets.app-private-key }}
+      PAT: ${{ secrets.GRADLE_UPDATE_PAT || secrets.token }}
     steps:
       # A partial credential mints no token either way; refuse it explicitly
       # rather than silently falling back to GITHUB_TOKEN, which would read
