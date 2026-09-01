@@ -51,6 +51,20 @@ test("every GH_TOKEN in the publish job prefers a PAT, then the minted App token
   }
 });
 
+test("both jobs fetch the engine at the running workflow's own revision, never at one the update job reported", () => {
+  // The update job used to record the engine's sha as a job output and
+  // publish checked the validator out at it. Every other output is bounded
+  // to "a failed comparison" in publish; that one was a code pointer, and a
+  // forged one would have pointed publish — write credential in its env —
+  // at any commit reachable from this repository, a fork's PR head
+  // included. `job.workflow_sha` comes from the runner's own context, and
+  // it is also what makes a consumer piloting `@branch` run that branch's
+  // engine rather than main's.
+  const pins = [...workflow.matchAll(/repository: mikelward\/gradle-update\n(?:[ \t]*#[^\n]*\n)*[ \t]*ref: ([^\n]*)\n/g)].map((m) => m[1]);
+  assert.deepEqual(pins, ["${{ job.workflow_sha }}", "${{ job.workflow_sha }}"], `expected both engine checkouts pinned to job.workflow_sha, found ${JSON.stringify(pins)}`);
+  assert.doesNotMatch(workflow, /engine_sha|steps\.engine\b|Record the engine revision/, "no engine revision may travel as a job output");
+});
+
 test("the token secret is declared optional and read into env.PAT", () => {
   assert.match(workflow, /^\s*token:\s*$/m, "the reusable workflow must declare a token secret");
   assert.match(workflow, /PAT: \$\{\{ secrets\.token \}\}/, "the publish job must read secrets.token into env.PAT");

@@ -52,6 +52,17 @@ moment they finish. Extend that pattern rather than widening it: a second way
 for post-fingerprint code to reach the batch without its own declared,
 fingerprinted boundary removes the guarantee the two-job split provides.
 
+**The validator publish runs is pinned by the runner, not reported by the
+update job.** Both jobs fetch this repository at `job.workflow_sha` — the
+revision of the workflow that is running, whichever ref the caller named.
+It used to travel as a job output of the update job, and a job output is
+something that job writes: every other output is bounded to "a failed
+comparison" in publish, but that one was a code pointer, and a forged one
+would have pointed publish, with the write credential in its env, at any
+commit reachable from this repository — a fork's pull request head
+included. The pin also means a consumer piloting `@branch` runs that
+branch's engine rather than main's.
+
 ## What this repository must not grow
 
 - **No dependencies. No `package.json`, no lockfile, no build step.** What a
