@@ -120,6 +120,46 @@ costing maintenance:
 
 ## Known gaps
 
+- **A test-only batch ships a release like any other, on purpose** (2026-09-05,
+  PR #33). The batch subject is bare by default and is never classified by what
+  moved, so a week that touched only JUnit or Robolectric still reaches a
+  consumer's release-note filter as release-worthy and spends a build — a billed
+  one on a private consumer — for an APK whose behavior did not change. (A
+  consumer that wants a prefix on every batch sets `commit-prefix`; what is
+  ruled out is deciding it per batch.)
+
+  Classifying the batch by scope was built in full and deleted before merging:
+  each moved `[versions]` key mapped to the Gradle configurations its aliases
+  appear in, derived in the publish job from its own clean checkout. Six review
+  findings were one failure repeated — reading "test-only" from evidence that
+  merely was not contradicted, and so suppressing the release for a dependency
+  that does ship:
+
+  - a `latest` product flavor generates `latestImplementation`, which a
+    substring match reads as a test configuration;
+  - an alias can reach a build script only as a member of a `libs.bundles.*`
+    entry, hiding behind a test-only sibling of the same key;
+  - a bundle array split across lines is invisible to a line-based catalog
+    reader;
+  - a key backing both a plugin and a test-only library;
+  - a production dependency declared in an applied script or under a custom
+    `buildFileName`, which no walk of `build.gradle{,.kts}` sees.
+
+  Each was fixable and four were fixed; the class was not. Every one surfaced
+  the same way, and the ones still unfound would surface the same way too — as
+  a release that silently did not happen. Shipping the update matters more than
+  the precision of the release notes (maintainer, 2026-09-05).
+
+  **Not a task.** Reopening it needs a source that ANSWERS the question without
+  executing the consumer's build — the consumer declaring scope as an input,
+  say — not a better scanner. Asking Gradle to report its own configurations is
+  the tempting version and is ruled out by the trust split: producing that
+  report runs the consumer's scripts and plugins, which the publish job must
+  never do, and a report from the update job is exactly the untrusted code
+  deciding whether its own batch announces itself. The sibling
+  hubs could read `devDependencies` and `[dev-dependencies]` straight from the
+  manifest, which is more reliable than anything available here, and still
+  don't, so a bump is announced everywhere on the same terms.
 - **The App-token support is wired hub-side only** (2026-08-19); no consumer
   repository passes `secrets: app-id/app-private-key` yet, so every one
   still hits the first-time-contributor approval gate on its own `on:

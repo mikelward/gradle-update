@@ -168,10 +168,18 @@ keeps its secrets environment-scoped.
   a consumer could notice the difference. There is no `feat:` or `fix:`, on
   purpose — they would prefix nearly everything and leave the log as flat as
   it started.
-- **The batch commit this workflow writes is bare by default**, and that is
-  deliberate: a dependency bump changes the shipped build, and on the Android
-  consumers its subject goes straight into the Play release notes. Don't give
-  it a prefix to tidy a consumer's log.
+- **The batch commit this workflow writes is bare by default and is never
+  classified by scope**: a dependency bump changes the shipped build, and on
+  the Android consumers its subject goes straight into the Play release notes.
+  Don't give it a prefix to tidy a consumer's log. A consumer that wants one on
+  every batch sets `commit-prefix`; deciding it per batch from what moved was
+  built and deleted (`TODO.md`), because every way of inferring "test-only"
+  failed by silently not shipping a release. Revisit only with a source that
+  ANSWERS the question without executing the consumer's build — the consumer
+  declaring scope as an input, say. Not a better scanner, and not Gradle's own
+  report of its configurations: producing that runs the consumer's scripts and
+  plugins, which publish must never do and the update job's output can never be
+  trusted for.
 
 ## Privacy
 
