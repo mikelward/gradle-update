@@ -148,6 +148,11 @@ keeps its secrets environment-scoped.
   design, not another bug.** Look for the same shape elsewhere before fixing
   it, and ask whether a different design would delete the class rather than the
   instance; a design change is the maintainer's call, not one to make solo.
+- **Restate every review finding in chat, not just the count.** One bullet
+  each: review comment, top-level comment or review body alike, most blocking
+  first — what it claims, where, and what you did about it, or the options
+  where it's the maintainer's call. Summarize them all in that one reply;
+  ask only the most blocking question.
 - **Never leave a review thread silently dismissed** — every thread ends in a
   reply or a resolve.
 
