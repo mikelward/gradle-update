@@ -45,15 +45,24 @@ const classify = (path) => {
 describe("the lane policy", () => {
   test("parses to the intended shape, nothing wider", () => {
     // A rule this suite has not vetted is a rule nothing here exercises.
-    assert.deepEqual(rules, [{ verdict: "docs", pattern: "**/*.md" }]);
+    assert.deepEqual(rules, [
+      { verdict: "code", pattern: "AGENTS.md" },
+      { verdict: "docs", pattern: "**/*.md" },
+    ]);
     assert.deepEqual(directives.prefixes, ["docs"]);
     assert.deepEqual(directives["dispatch-without-pr"], ["refuse"]);
   });
 
   test("markdown rides the docs lane, at the root and nested", () => {
-    for (const path of ["README.md", "AGENTS.md", "docs/notes.md"]) {
+    for (const path of ["README.md", "docs/notes.md"]) {
       assert.equal(classify(path), "docs", path);
     }
+  });
+
+  test("AGENTS.md carries tested front matter, so it rides the code lane", () => {
+    // agents-front-matter.test.js asserts the front matter at its top; as
+    // docs, an AGENTS.md-only edit could break it with that test never run.
+    assert.equal(classify("AGENTS.md"), "code");
   });
 
   test("everything a consumer's weekly run executes is code", () => {
