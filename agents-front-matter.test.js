@@ -39,7 +39,15 @@ test("front matter marks the guide always on", () => {
 });
 
 test("front matter carries a last_modified date", () => {
-  assert.match(fields.last_modified ?? "", /^\d{4}-\d{2}-\d{2}$/);
+  const value = fields.last_modified ?? "";
+  assert.match(value, /^\d{4}-\d{2}-\d{2}$/);
+  // The pattern alone accepts 2026-02-31; a real date round-trips unchanged.
+  assert.equal(new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10), value);
+});
+
+test("the guide tells agents to report the loaded file at session start", () => {
+  assert.match(text, /At\s+the\s+start\s+of\s+every\s+session,\s+print\s+the\s+full\s+absolute\s+path\s+of\s+the\s+`AGENTS\.md`\s+you\s+loaded\s+and\s+its\s+`last_modified`\s+date/);
+  assert.match(text, /Bump\s+`last_modified`\s+whenever\s+you\s+edit\s+this\s+file/);
 });
 
 // Claude Code reads CLAUDE.md and Gemini / Antigravity read GEMINI.md; each
