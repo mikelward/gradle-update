@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-04
+last_modified: 2026-10-15
 ---
 
 # AGENTS.md
@@ -164,6 +164,12 @@ keeps its secrets environment-scoped.
   `codex` status: post the rebuttal, then `@codex review` once — or let the
   next push do it, if the rebuttal is up first. Escalate if it re-raises, or if
   five minutes on that review has not landed either.
+- **Once Codex has +1'd a PR's head, never make an unnecessary change to it
+  without asking first** (maintainer, 2026-10-13): a to-do, tidy-up or extra
+  fix re-runs CI and Codex for nothing, so it waits for a yes or goes in a
+  follow-up PR. A necessary change goes ahead unasked — a rebase for a `dirty`
+  branch, or a `behind` one where the ruleset requires it up to date, a fix for
+  red CI.
 - **A second verified finding in the same mechanism is evidence about the
   design, not another bug.** Look for the same shape elsewhere before fixing
   it, and ask whether a different design would delete the class rather than the
