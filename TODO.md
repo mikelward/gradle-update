@@ -16,6 +16,10 @@
       ruleset waits on forever) — the posture piloted in mikelward/lanes
       and mikelward/ci-commit-artifact. Fold into the same repo-rules
       invocation as the lanes flip.
+- [ ] **Check `AGENTS.md` < 24,000 bytes in CI** (as mikelward/stopdash#932
+      plans): add `test "$(wc -c < AGENTS.md)" -lt 24000` to `ci.yml` on the
+      docs path, so `AGENTS.md` cannot silently grow past Antigravity's
+      24,000-byte per-file rule cap, which truncates the tail.
 
 ## Reconsider later
 
