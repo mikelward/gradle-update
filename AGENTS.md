@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-15
+last_modified: 2026-10-17
 ---
 
 # AGENTS.md
@@ -192,6 +192,9 @@ keeps its secrets environment-scoped.
 
 ## Talking to the user
 
+- **One question at a time** — in plain chat or the client's question tool
+  (`AskUserQuestion` in Claude Code, `ask_question` in Antigravity). Stop and
+  wait for the answer before proceeding on an assumed one.
 - **Answer a mid-turn message first.** A user message that arrives while you're
   working — the "sent while you were working" interjection — is addressed in
   your very next output, before any further tool call, even if it's one
