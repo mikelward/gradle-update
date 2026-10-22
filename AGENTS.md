@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-17
+last_modified: 2026-10-22
 ---
 
 # AGENTS.md
@@ -147,9 +147,12 @@ its secrets environment-scoped.
   over-strict reading (privacy especially, where stricter feels safer) costs
   real capability, and a genuine rule-vs-code conflict is the maintainer's
   call, never settled by quietly narrowing the code. Declining doesn't clear
-  the required `codex` status: post the rebuttal, then `@codex review` once
-  (or let the next push, if the rebuttal is up first); escalate if it
-  re-raises, or that review is still missing five minutes on.
+  the required `codex` status: post the rebuttal, then `@codex review` (or let
+  the next push, if the rebuttal is up first); escalate if it re-raises. A
+  hung review — nothing back five minutes after a push or poke, or stuck at
+  running (👀) ten minutes on — gets `@codex review`; a poke that hangs the
+  same way gets a second an hour later, and only a second that hangs too is
+  escalated, never the first (maintainer, 2026-10-22).
 - **Once Codex has +1'd a head, make no unnecessary change without asking**
   (maintainer, 2026-10-13): a to-do, tidy-up or extra fix re-runs CI and Codex
   for nothing, so it waits for a yes or a follow-up PR. A necessary change
@@ -167,9 +170,8 @@ its secrets environment-scoped.
 - **Defer a real out-of-scope finding** rather than ask to merge past it:
   commit and push a `TODO.md` entry first, reply citing its sha, resolve (a
   threadless finding — top-level comment, review body — skips only the
-  resolve). The push re-triggers Codex: poke only after five minutes with
-  nothing back; escalate if the re-review re-raises it, or is still missing
-  five minutes after the poke.
+  resolve). The push re-triggers Codex: poke only once it hangs, as above;
+  escalate if the re-review re-raises it.
 
 ## Talking to the user
 
