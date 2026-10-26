@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-23
+last_modified: 2026-10-26
 ---
 
 # AGENTS.md
@@ -180,7 +180,9 @@ its secrets environment-scoped.
   wait for the answer rather than proceed on an assumed one.
 - **Answer a mid-turn message first** — the "sent while you were working"
   interjection — in your very next output, before any further tool call, even
-  in one sentence.
+  in one sentence. **Claude Code only** (maintainer, 2026-10-25): its app
+  reliably shows just a turn's last message, so reply only there, answering a
+  mid-turn message at a stopping point soon.
 - **Message only when the user needs to see it** (maintainer, 2026-10-15):
   each notifies their phone. Work in silence; speak up for a question or
   blocker, something to merge or act on, a merge, or a change from the plan or
