@@ -60,3 +60,12 @@ for (const name of ["CLAUDE.md", "GEMINI.md"]) {
     assert.equal(readlinkSync(file), "AGENTS.md");
   });
 }
+
+// Antigravity silently truncates a rule file past 24 KB; the guide holds
+// itself to 22,000 bytes so the next rule added can't cut off the tail.
+test("AGENTS.md stays under its stated 22,000-byte cap", () => {
+  assert.match(text, /under 22,000 bytes/);
+  const bytes = Buffer.byteLength(text, "utf8");
+  assert.ok(bytes > 0, "AGENTS.md must not be empty");
+  assert.ok(bytes <= 22000, `AGENTS.md is ${bytes} bytes, over the 22,000-byte cap`);
+});
