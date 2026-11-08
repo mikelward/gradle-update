@@ -58,7 +58,7 @@ jobs:
       docs_only: ${{ steps.lane.outputs.docs_only }}
       base_sha: ${{ steps.lane.outputs.base_sha }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
           persist-credentials: false
       - uses: mikelward/lanes@main
@@ -73,7 +73,7 @@ jobs:
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
           persist-credentials: false
 
@@ -105,7 +105,7 @@ jobs:
     needs: [classify, test]
     if: always()
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
           persist-credentials: false
       - uses: mikelward/lanes@main
@@ -129,7 +129,7 @@ jobs:
     needs: [classify, test]
     if: always()
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
           persist-credentials: false
       - uses: mikelward/lanes@main
